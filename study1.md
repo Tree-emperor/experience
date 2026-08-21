@@ -1111,3 +1111,192 @@ public void execute(SecondScheduler scheduler) {
 ```
 ---
 
+## 七、任务调度执行 - 本质解读
+一句话概括
+所谓的"处理任务"，就是通过 HTTP REST API 调用智算服务平台，驱动任务在智算集群上执行，并跟踪任务状态直到完成。
+
+### 核心调用链
+
+```java
+SrconTaskScheduler                    TaskStatusExecutor              IntelligentInvoke
+(调度层 - 10秒轮询)                   (执行层 - N秒轮询)               (API调用层)
+     │                                    │                              │
+     ▼                                    ▼                              ▼
+ 扫描QUEUING任务 ──────────────────> 扫描RUNNING任务 ───────────────> REST API调用
+ 按优先级排序                          构建任务Pipeline                  │
+ 分配集群资源                          策略模式执行子任务                ▼
+ 更新状态为RUNNING                     状态同步 & 持久化           智算服务平台
+                                                                 (外部系统)
+
+```
+
+### 调度框架
+#### 3.1 第一层：任务调度 (SrconTaskScheduler)
+职责：资源分配 + 状态升级
+
+```java
+@Scheduled(fixedRate = 10000, initialDelay = 3000)  // 每10秒
+public void schedulePendingTasks() {
+    // 1. 获取分布式锁（Redis）
+    // 2. 查询所有 QUEUING 状态的任务
+    List<SrconTaskInfo> srconTaskInfos = srconTaskDao.queryTasksByStatus("queuing");
+    // 3. 按优先级排序
+    srconTaskInfos.sort((a, b) -> Integer.compare(b.getPriorityScore(), a.getPriorityScore()));
+    // 4. 分配集群资源
+    for (SrconTaskInfo taskInfo : srconTaskInfos) {
+        ClusterResourceResult result = clusterService.allocateClusterResource(taskInfo);
+        // 5. 更新状态为 RUNNING
+        srconTaskDao.updateTaskRunning(taskInfo.getTaskId(), result);
+    }
+}
+
+```
+本质：把任务从"排队中"变为"分配了资源、准备执行"
+
+#### 3.2 第二层：任务状态执行 (TaskStatusExecutor)
+职责：Pipeline 构建 + 策略执行
+
+```java
+@Scheduled(fixedDelayString = "${smart-scheduler.cron.task-status-scheduler}")  // 可配置周期
+public void scheduler() {
+    // 1. 获取分布式锁
+    // 2. 查询所有 RUNNING 状态的任务
+    List<TaskInfo> runningTasks = taskDao.queryRunningTasks();
+    // 3. 遍历处理
+    for (TaskInfo taskInfo : runningTasks) {
+        // 4. 构建或获取任务Pipeline
+        List<SecondScheduler> secondSchedulers = getSecondSchedulers(taskInfo);
+        // 5. 策略模式执行每个子任务
+        for (SecondScheduler scheduler : secondSchedulers) {
+            schedulerFactory.execute(scheduler);  // 根据状态匹配策略
+        }
+    }
+}
+
+```
+Pipeline 是什么：一个任务被拆分成多个子任务步骤 (SecondScheduler)
+
+
+```java
+// 以 Prediction 预测任务为例，其 Pipeline 包含：
+Pipeline = [
+    SecondScheduler(step=1, invoke="infer_rca"),      // RCA推理
+    SecondScheduler(step=2, invoke="cbb"),            // CBB后处理
+    SecondScheduler(step=3, invoke="t0"),             // T0处理
+    SecondScheduler(step=4, invoke="srcon_agent"),    // Agent解释
+    SecondScheduler(step=5, invoke="agent_complaint_prepare")  // 投诉准备
+]
+
+```
+#### 3.3 第三层：智算服务调用 (IntelligentInvoke)
+
+职责：HTTP API 封装
+
+
+```java
+// 启动任务
+public String start(SecondScheduler scheduler, boolean isBreakpointRetry) {
+    // 1. 构建请求参数
+    ParameterBuilder builder = getBuilder(scheduler.getInvoke());
+    ImmutablePair<String, JSONObject> pair = builder.buildStart(intelligentRecord, isBreakpointRetry);
+    
+    // 2. 构造HTTP请求
+    RestRecord execRecord = new RestRecord(pair.left, pair.right, scheduler.getProxy());
+    
+    // 3. 发送POST请求
+    JSONObject response = RestUtil.sendPostJsonRequest(execRecord);
+    
+    // 4. 解析响应，保存结果
+    ModelTaskResult modelTaskResult = buildModelTaskResult(scheduler, response);
+    taskDao.saveModelTaskResult(modelTaskResult);
+    
+    return TaskStatus.RUNNING.getStatus();  // 返回任务在智算侧的状态
+}
+
+// 查询状态
+public String status(SecondScheduler scheduler) {
+    ParameterBuilder builder = getBuilder(scheduler.getInvoke());
+    ImmutablePair<String, JSONObject> pair = builder.buildSearch(intelligentRecord);
+    RestRecord execRecord = new RestRecord(pair.left, pair.right, scheduler.getProxy());
+    JSONObject response = RestUtil.sendPostJsonRequest(execRecord);
+    return covertStatus(response);  // 转换智算侧状态 -> 内部状态
+}
+
+```
+
+### 具体在干什么 - 以预测任务为例
+
+
+```
+用户发起"预测任务"
+         │
+         ▼
+┌─────────────────────────────────────────────────────────────┐
+│ 第一阶段：任务创建 (createTask)                               │
+│ - 生成子任务ID                                               │
+│ - 计算优先级                                                 │
+│ - 分配存储资源                                               │
+│ - 插入数据库，状态=INIT                                      │
+└─────────────────────────────────────────────────────────────┘
+         │
+         ▼
+┌─────────────────────────────────────────────────────────────┐
+│ 第二阶段：任务启动 (startTask)                                │
+│ - 更新状态 INIT -> QUEUING                                  │
+└─────────────────────────────────────────────────────────────┘
+         │
+         ▼
+┌─────────────────────────────────────────────────────────────┐
+│ 第三阶段：任务调度 (SrconTaskScheduler 每10秒)                │
+│ - 扫描 QUEUING 任务                                          │
+│ - 分配集群资源 (GPU服务器)                                   │
+│ - 更新状态 QUEUING -> RUNNING                                │
+└─────────────────────────────────────────────────────────────┘
+         │
+         ▼
+┌─────────────────────────────────────────────────────────────┐
+│ 第四阶段：Pipeline执行 (TaskStatusExecutor)                  │
+│                                                             │
+│ Step 1: infer_rca (RCA推理)                                 │
+│   ├─ QueuingStrategy.handle()                               │
+│   ├─ 构建请求参数 {input_path, model, rat, ...}             │
+│   ├─ HTTP POST 到智算平台                                    │
+│   ├─ 返回 task_id, status=running                           │
+│   └─ 状态: queuing -> running                               │
+│                                                             │
+│ Step 2: cbb (后处理) - 等待Step1完成                         │
+│   ...                                                       │
+│                                                             │
+│ Step 3-5: 类似处理...                                       │
+└─────────────────────────────────────────────────────────────┘
+         │
+         ▼
+┌─────────────────────────────────────────────────────────────┐
+│ 第五阶段：状态同步 (RunningStrategy 每N秒)                    │
+│ - 轮询智算平台: HTTP POST status API                        │
+│ - 获取当前阶段 current_stage                                 │
+│ - 获取结果路径 result_path                                   │
+│ - 更新本地 ModelTaskResult                                  │
+└─────────────────────────────────────────────────────────────┘
+         │
+         ▼
+┌─────────────────────────────────────────────────────────────┐
+│ 第六阶段：任务完成                                           │
+│ - 所有子任务 Success -> 任务整体 SUCCESS                     │
+│ - 模型更新: modelTransferService.modelUpdate()              │
+│ - 结果数据在 sftpMountPrefix 目录                           │
+└─────────────────────────────────────────────────────────────┘
+
+```
+### 总结
+|问题|	答案|
+|--|--|
+|处理任务处理了什么？|	通过 REST API 驱动智算平台执行任务|
+|核心操作是什么？	|start() 启动任务、status() 查询状态|
+|任务怎么拆解？	|按 invoke 类型拆成 Pipeline，多步骤串行执行|
+|如何跟踪进度？	|定时轮询智算平台 API，状态同步到本地数据库|
+|任务间关系？	|Pipeline 中前一步输出作为后一步输入，通过 result_path 传递|
+|外部依赖？	|智算服务平台 (AI PDU/Manas)，通过 HTTP 调用|
+
+
+
