@@ -865,14 +865,17 @@ public void handle(SecondScheduler secondScheduler) {
     }
 }
 ```
+
 策略链顺序及作用:
-顺序	策略	触发条件	作用
-1	TimeoutStrategy	任意状态	检查是否超时，超时则标记失败
-2	QueuingStrategy	status == QUEUING	调用执行器的 execute() 方法开始执行
-3	RunningStrategy	status == RUNNING	调用执行器的 status() 方法查询状态
-4	PendingStrategy	status == PENDING	等待前置条件
-5	FailedStrategy	status == FAILURE	记录失败信息
-6	SuccessStrategy	status == SUCCESS	成功计数
+|顺序|	策略|	触发条件|	作用|
+|--|--|--|--|
+|1|	TimeoutStrategy|	任意状态	|检查是否超时，超时则标记失败|
+|2|	QueuingStrategy|	status == QUEUING	|调用执行器的 execute() 方法开始执行|
+|3|	RunningStrategy|	status == RUNNING	|调用执行器的 status() 方法查询状态|
+|4|	PendingStrategy|	status == PENDING	|等待前置条件|
+|5|	FailedStrategy|	status == FAILURE	|记录失败信息|
+|6|	SuccessStrategy|	status == SUCCESS	|成功计数|
+
 ---
 ### 步骤5：执行器分发
 QueuingStrategy 根据 invoke 类型分发到具体执行器：
@@ -885,14 +888,16 @@ private TaskStatus executeTask(final SecondScheduler secondScheduler) {
 ```
 
 MExecutorFactory 的分发映射：
-invoke值	执行器	execute() 实际动作
-paramInit	TaskParamInitializingExecutor	初始化任务参数
-download	DownloadExecutor	从SFTP/HDFS下载数据
-intelligent	IntelligentInvokeExecutor	调用智算侧API启动训练/推理
-dataFunction	DataFunctionExecutor	执行数据处理（裁剪、转换等）
-upload	UploadExecutor	上传结果到存储
-cbbAppDB	CBBAppDBExecutor	CBB后处理结果入库
-T0	类似处理	T0后处理
+
+|invoke值|	执行器|	execute() 实际动作|
+|--|--|--|
+|paramInit|	TaskParamInitializingExecutor|	初始化任务参数|
+|download|	DownloadExecutor|	从SFTP/HDFS下载数据|
+|intelligent|	IntelligentInvokeExecutor|	调用智算侧API启动训练/推理|
+|dataFunction|	DataFunctionExecutor|	执行数据处理（裁剪、转换等）|
+|upload	|UploadExecutor	|上传结果到存储|
+|cbbAppDB|	CBBAppDBExecutor|	CBB后处理结果入库|
+|T0	|类似处理	|T0后处理|
 ---
 
 ### 步骤6：IntelligentInvokeExecutor 执行智算任务
@@ -1014,10 +1019,11 @@ TaskStatusExecutor.schedule()
 ```
 ---
 关键点总结
-问题	答案
-定时调度多久触发	每分钟 (@Scheduled(cron = "0 */1 * * * *"))
-每次调度处理什么	所有状态为 QUEUING/RUNNING 的 SecondScheduler
-如何决定执行顺序	按 batchNo → step 顺序执行
-如何触发实际执行	QueuingStrategy 调用执行器的 execute() 方法
-如何知道执行结果	RunningStrategy 调用执行器的 status() 方法查询
-失败怎么办	记录错误码，停止后续步骤和批次执行
+|问题	|答案|
+|--|--|
+|定时调度多久触发|	每分钟 (@Scheduled(cron = "0 */1 * * * *"))|
+|每次调度处理什么|	所有状态为 QUEUING/RUNNING 的 SecondScheduler|
+|如何决定执行顺序|	按 batchNo → step 顺序执行|
+|如何触发实际执行|	QueuingStrategy 调用执行器的 execute() 方法|
+|如何知道执行结果|	RunningStrategy 调用执行器的 status() 方法查询|
+|失败怎么办|	记录错误码，停止后续步骤和批次执行|
