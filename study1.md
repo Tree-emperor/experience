@@ -1,1302 +1,1023 @@
-## STDT_SmartScheduler 项目分析报告
-
-STDT_SmartScheduler 是华为内部开发的一个 **智能任务调度平台**，主要用于管理和调度 AI 模型平台的任务的生命周期。系统核心功能包括：
-1. 任务调度与执行 - 管理 AI 模型训练、预测、推理等任务的完整生命周期
-2. 资源管理 - 集群资源分配、调度和监控
-3. 指标采集与上报 - 采集 Token 使用量、模型调用等运营指标
-4. 模型生命周期管理 - 模型的导入、导出、同步、存储管理
-
-### 1 项目结构
-
-```
-STDT_SmartScheduler/
-├── pom.xml                 # 父模块，Maven 多模块项目
-├── Shard/                  # 共享模块（被 Service 依赖）
-│   └── src/main/java/      # 共享实体、工具类、异常、Handler
-└── Service/                # 服务模块
-    ├── metric-management/  # 指标管理子模块
-    │   ├── application/    # REST接口层
-    │   ├── business/       # 业务逻辑层
-    │   └── infrastructure/ # 数据访问层
-    └── task-management/    # 任务管理子模块
-        ├── application/    # REST接口层
-        ├── business/       # 业务逻辑层（Scheduler、Service、策略模式）
-        └── infrastructure/ # 数据访问层
-```
-### 2 任务调度功能流程
-
-任务调度流程
-1. 创建任务 → SrconTaskController.createTask()
-2. 启动任务 → SrconTaskController.startTask()
-3. 定时调度 → SrconTaskScheduler（轮询任务状态）
-4. **策略执行** → SchedulerFactory 根据任务状态选择对应 Strategy
-5. 状态同步 → SrconTaskController.statusSync()
-6. 结果存储 → TaskDaoImpl 持久化到数据库
-
-#### 2.1 调度架构
 
 
-```
-┌─────────────────────────────────────────────────────────────────┐
-│                     调度入口层                                   │
-│  ┌─────────────────────┐    ┌──────────────────────────────┐   │
-│  │ SrconTaskScheduler  │    │    TaskStatusExecutor        │   │
-│  │ (轮询QUEUING任务)    │    │    (轮询RUNNING任务)         │   │
-│  │ 10秒/次              │    │    Cron表达式配置             │   │
-│  └─────────────────────┘    └──────────────────────────────┘   │
-└─────────────────────────────────────────────────────────────────┘
-                              ↓
-┌─────────────────────────────────────────────────────────────────┐
-│                     策略执行层                                   │
-│  ┌─────────────────────────────────────────────────────────┐   │
-│  │         SchedulerFactory (策略工厂)                      │   │
-│  │  ┌─────────┐ ┌─────────┐ ┌─────────┐ ┌─────────┐       │   │
-│  │  │ Success │ │ Queuing │ │Running  │ │ Failed  │ ...   │   │
-│  │  │Strategy │ │Strategy │ │Strategy │ │Strategy │       │   │
-│  │  └─────────┘ └─────────┘ └─────────┘ └─────────┘       │   │
-│  └─────────────────────────────────────────────────────────┘   │
-└─────────────────────────────────────────────────────────────────┘
-                              ↓
-┌─────────────────────────────────────────────────────────────────┐
-│                     调用执行层                                   │
-│  ┌─────────────────────────────────────────────────────────┐   │
-│  │         IInvoke (IntelligentInvoke)                     │   │
-│  │  ┌──────────────────────────────────────────────────┐   │   │
-│  │  │           ParameterBuilder (策略+工厂)            │   │   │
-│  │  │  TrainParameterBuilder / RcaInferParameterBuilder │   │   │
-│  │  │  UemInferParameterBuilder / EvaluationParameter... │   │   │
-│  │  └──────────────────────────────────────────────────┘   │   │
-│  └─────────────────────────────────────────────────────────┘   │
-└─────────────────────────────────────────────────────────────────┘
-```
-
-#### 2.2 任务状态定义 (TaskStatus)
-系统定义了 17 种任务状态，核心状态流转：
-
-```
-INIT → QUEUING → RUNNING → SUCCESS/FAILURE/STOP
-                      ↓
-                  PENDING (智算侧排队)
-```
-
-#### 2.3 调度器组件 (SrconTaskScheduler)
-
-职责：处理 QUEUING（排队中） 状态的任务，为其分配集群资源
-
-```
-@Scheduled(fixedRate = 10000, initialDelay = 3000)
-public void schedulePendingTasks()
-```
-核心流程：
-1. 获取 Redis 分布式锁（防止多实例重复执行）
-        ↓
-2. 查询所有 QUEUING 状态的任务
-        ↓
-3. 按优先级 score 降序排序
-        ↓
-4. 遍历调度每个任务:
-   a. 调用 `ClusterService.allocateClusterResource()` **分配集群资源**
-   b. 如果分配成功，更新任务状态为 RUNNING
-优先级调度：任务按照 priorityScore 倒序排列，优先调度高优先级任务
-
-
-#### 2.4 集群资源分配 (ClusterServiceImpl)
-
-职责：为任务分配合适的集群节点
-算法：
-1. 获取任务所需卡数 (cardCount)
-        ↓
-2. 查询所有集群的总卡数和当前使用量
-        ↓
-3. 计算每个集群的可用卡数 = 总卡数 - 已用卡数
-        ↓
-4. 选择可用卡数最多的集群分配
-
-
-#### 2.5 任务状态执行器 (TaskStatusExecutor) ⭐
-
-职责：处理 RUNNING（运行中） 状态的任务，同步任务状态
-
-##### 2.5.1 整体架构图
-
-```
-┌─────────────────────────────────────────────────────────────────────────────┐
-│                        TaskStatusExecutor 架构                               │
-├─────────────────────────────────────────────────────────────────────────────┤
-│                                                                             │
-│  @Scheduled(cron) ──→ scheduler()                                           │
-│         │                                                                   │
-│         ├─ 获取Redis分布式锁                                                 │
-│         ├─ 查询RUNNING状态的主任务列表                                        │
-│         └─ doScheduler(list)  ──并行执行──┐                                 │
-│                                           ↓                                  │
-│                         ┌─────────────────────────────────┐                 │
-│                         │         线程池并行处理            │                 │
-│                         │  ┌─────────┐ ┌─────────┐       │                 │
-│                         │  │execute()│ │execute()│ ...  │                 │
-│                         │  │ task_1  │ │ task_2  │       │                 │
-│                         │  └────┬────┘ └────┬────┘       │                 │
-│                         │       │          │            │                 │
-│                         │       ↓          ↓            │                 │
-│                         │  ┌─────────────────────┐      │                 │
-│                         │  │ SchedulerFactory    │      │                 │
-│                         │  │ (策略工厂)           │      │                 │
-│                         │  │                     │      │                 │
-│                         │  │ StopStrategy        │      │                 │
-│                         │  │ SuccessStrategy     │      │                 │
-│                         │  │ QueuingStrategy     │      │                 │
-│                         │  │ RunningStrategy     │      │                 │
-│                         │  │ FailedStrategy      │      │                 │
-│                         │  │ PendingStrategy     │      │                 │
-│                         │  └─────────────────────┘      │                 │
-│                         └─────────────────────────────────┘                 │
-│                                           ↓                                  │
-│                         CountDownLatch.await(30分钟)                         │
-│                                           ↓                                  │
-│                         超时取消未完成任务 futureCancel()                     │
-│                                                                             │
-└─────────────────────────────────────────────────────────────────────────────┘
-```
-
-##### 2.5.2 完整时序图梳理
-
-
-```
-主线程                                              Worker线程
-  │                                                   │
-  ├─ scheduler() ──────────────────────────────────▶ │
-  │   ├─ redisLock.lock()                            │
-  │   ├─ queryRunningTasks()                         │
-  │   └─ doScheduler(list)                           │
-  │        ├─ latch = CountDownLatch(3)              │
-  │        ├─ executorService = ThreadPoolFactory    │
-  │        │                                          │
-  │        ├─ runAsync(execute(task1)) ──────────────▶│ execute(task1)
-  │        ├─ runAsync(execute(task2)) ──────────────▶│ execute(task2)
-  │        ├─ runAsync(execute(task3)) ──────────────▶│ execute(task3)
-  │        │                                          │
-  │        └─ latch.await() ◀─────────────────────────┼─ latch.countDown()
-  │             (阻塞等待)                             │   (task1完成)
-  │                                                   │◀─ latch.countDown()
-  │                                                   │   (task2完成)
-  │             (继续执行) ◀─────────────────────────┼─ latch.countDown()
-  │                                                   │   (task3完成)
-  │   ├─ redisLock.unlock()                          │
-  │   └─ 方法返回                                     │
-  │                                                   │
-  │                                                   │
-Worker线程1 执行 execute(task1):
-  │                                                   │
-  ├─ getSecondSchedulers()                           │
-  │   ├─ queryTaskPipelines() ──查不到──┐           │
-  │   └─ createTaskPipeline() ◀─────────┘           │
-  │        └─ 创建 [train, infer_rca, cbb]           │
-  │            所有子任务 status = QUEUING           │
-  │                                                   │
-  ├─ buildSchedulerStrategy()                        │
-  │   └─ 创建 SchedulerFactory + AtomicInteger(0)    │
-  │                                                   │
-  ├─ for train:                                      │
-  │   ├─ preStatus = "QUEUING"                       │
-  │   ├─ schedulerFactory.execute(train)             │
-  │   │   └─ QueuingStrategy.handle()                │
-  │   │        └─ invoke.start() ──HTTP──┐          │
-  │   │                                   │          │
-  │   ├─ train.setStatus("running")       │          │
-  │   ├─ shouldBreakAfterUpdate() → true  │          │
-  │   └─ BREAK;  // 退出循环               │          │
-  │                                                   │
-  ├─ atomicInteger.get() == 1 != 3                   │
-  │   └─ 不更新主任务为SUCCESS                        │
-  │                                                   │
-  └─ latch.countDown()                               │
-                                                      │
-Worker线程2 执行 execute(task2):
-  │                                                   │
-  ... (同上，类似逻辑)                                 │
-                                                      │
-
-```
-
-##### 2.5.3 入口方法 scheduler()
-
+# 任务创建详细流程
+## 第一阶段：HTTP请求接收
+入口: TaskOperatorController.addTask() (第73行)
 
 ```java
-@Scheduled(cron = "${smart-scheduler.cron.task-status-scheduler}")
-public void scheduler() {
-    try {
-        // 1. 获取Redis分布式锁，防止多实例重复执行
-        redisLock.lock(PERIOD_EXEC_KEY, EXPIRE_TIME);
-        
-        // 2. 查询所有RUNNING状态的主任务
-        List<TaskInfo> list = taskDao.queryRunningTasks();
-        if (CollectionUtils.isEmpty(list)) {
-            return;
-        }
-        
-        // 3. 并行执行任务调度
-        doScheduler(list);
-    } catch (Exception ex) {
-        log.error("TaskStatusExecutor error", ex);
-    } finally {
-        // 4. 释放Redis锁
-        redisLock.unLock(PERIOD_EXEC_KEY);
-    }
+@PostMapping(value = "task-add", consumes = MediaType.MULTIPART_FORM_DATA_VALUE)
+public RestResponse addTask(@RequestPart(name = "taskInfo") String parameter,
+    @RequestPart(name = "file", required = false) MultipartFile file) {
+    return handleTaskOperation(parameter, file, ValidatorType.CREATE, taskOperatorService::createTask);
 }
-
 ```
-##### 2.5.4 并行执行 doScheduler() (使用线程池)⭐
-
+请求流程:
+1. 接收 taskInfo (JSON字符串) 和可选的标注文件
+2. 解析 taskInfo 为 TaskInfo 对象
+3. 设置默认值:
+   - creator: 从请求头获取当前用户名
+   - storeLoc: 从配置获取存储位置
+   - solutionType: 默认为 STANDARD
+4. 执行校验链 ValidatorChain.validate()
+5. 使用分布式锁 ReentrantLock 保证并发安全
+6. 调用 taskOperatorService.createTask()
+---
+## 第二阶段：任务创建核心逻辑
+核心方法: TaskOperatorService.createTask() (第114行)
 
 ```java
-private void doScheduler(final List<TaskInfo> list) {
-    // ============================================================
-    // 步骤1：初始化并行控制变量
-    // ============================================================
-    CountDownLatch latch = new CountDownLatch(list.size());  // 计数器=任务数量
-    ExecutorService executorService = ThreadPoolFactory.INSTANCE.get();  // 获取线程池
-    List<Future<?>> futures = new ArrayList<>();
-    
-    // ============================================================
-    // 步骤2：为每个主任务提交异步执行任务
-    // ============================================================
-    for (TaskInfo taskInfo : list) {
-        CompletableFuture<Void> future = CompletableFuture.runAsync(() -> execute(taskInfo, latch), executorService)
-            // 设置单个任务超时：10分钟
-            .orTimeout(SUB_TASK_TIME_OUT, TimeUnit.MINUTES)
-            // 异常处理：如果超时或出错，标记任务为失败
-            .exceptionally(ex -> {
-                updateTaskStatus(taskInfo, TaskStatus.FAILURE.getStatus());
-                log.error("=========> exec timeout or error: {}", JSON.toJSONString(taskInfo), ex);
-                return null;
-            });
-        futures.add(future);
-    }
-    
-    // ============================================================
-    // 步骤3：等待所有任务完成
-    // ============================================================
-    try {
-        // 等待所有任务完成，最多等待30分钟
-        boolean allDone = latch.await(ALL_TASK_TIME_OUT, TimeUnit.MINUTES);
-        if (!allDone) {
-            // 超时未全部完成，记录警告取消并未完成任务
-            log.warn("Some subtasks are not completed within the specified time.");
-            futureCancel(futures);
-        }
-    } catch (Exception ex) {
-        log.error("An interrupt exception occurred while waiting for the subtask to complete", ex);
-    }
+public RestResponse createTask(final MultipartFile file, final TaskInfo taskInfo) throws Exception {
+    // 1. 生成taskId
+    String taskId = taskInfo.getTaskId() == null || taskInfo.getTaskId().isEmpty()
+        ? taskDao.generateTaskId()  // 分布式ID生成器
+        : taskInfo.getTaskId();
+    taskInfo.setTaskId(taskId);
+    // 2. 执行检查并保存
+    return checkAndSaveTask(file, taskInfo);
 }
-
 ```
-
-
-
-#### 2.6 策略模式实现 (SchedulerStrategy) ⭐
-无论主任务还是子任务，根据任务状态匹配策略。
-##### 2.6.1 execute() 方法完整流程
+关键步骤1: 校验链检查 checkAndSaveTask() (第124行)
 
 ```java
-private void execute(TaskInfo taskInfo, CountDownLatch latch) {
-    try {
-        log.info("======> execute taskInfo={}", JSON.toJSONString(taskInfo));
-        
-        // ============================================================
-        // 步骤1：获取或创建子任务Pipeline
-        // ============================================================
-        List<SecondScheduler> secondSchedulers = getSecondSchedulers(taskInfo);
-        log.info("=====> secondSchedulers : {}", JSON.toJSONString(secondSchedulers));
-        
-        // ============================================================
-        // 步骤2：创建策略工厂（包含独立的成功计数器）
-        // ============================================================
-        AtomicInteger atomicInteger = new AtomicInteger(0);
-        SchedulerFactory schedulerFactory = buildSchedulerStrategy(atomicInteger);
-        
-        // ============================================================
-        // 步骤3：遍历执行每个子任务
-        // ============================================================
-        for (SecondScheduler scheduler : secondSchedulers) {
-            String preStatus = scheduler.getStatus();  // 执行前的状态
-            
-            // 根据状态匹配策略并执行
-            schedulerFactory.execute(scheduler);
-            
-            log.info("====> after execute: {}", JSON.toJSONString(scheduler));
-            
-            // ============================================================
-            // 步骤4：判断是否中断遍历
-            // ============================================================
-            if (shouldBreakAfterStrategy(scheduler)) {
-                break;  // 状态为UNKNOWN，中断
-            }
-            
-            // 更新数据库
-            updateSecondScheduler(scheduler, taskInfo, preStatus);
-            
-            if (shouldBreakAfterUpdate(scheduler)) {
-                break;  // 状态不是SUCCESS，中断
-            }
-        }
-        
-        // ============================================================
-        // 步骤5：判断是否所有子任务都成功
-        // ============================================================
-        if (atomicInteger.get() == secondSchedulers.size()) {
-            updateTaskStatus(taskInfo, TaskStatus.SUCCESS.getStatus());
-        }
-    } finally {
-        latch.countDown();  // 任务完成，计数器-1
-    }
-}
-
-```
-
-##### 2.6.2 任务 Pipeline 构建 (TaskGenerationFactory)
-职责：根据任务类型创建对应的子任务 pipeline
-###### 2.6.2.1 整体架构
-
-
-```
-┌─────────────────────────────────────────────────────────────────────────────┐
-│                     TaskGenerationFactory 工厂方法                           │
-├─────────────────────────────────────────────────────────────────────────────┤
-│                                                                             │
-│  TaskStatusExecutor.getSecondSchedulers()                                   │
-│         │                                                                   │
-│         └─▶ TaskGenerationFactory.createTaskPipeline(taskInfo)              │
-│                       │                                                     │
-│                       ▼                                                     │
-│              ┌─────────────────────┐                                        │
-│              │  strategyMap        │  (Spring注入的策略Map)                  │
-│              │  ─────────────────  │                                        │
-│              │  "training" ────────┼──▶ TrainingTaskStrategy                │
-│              │  "prediction" ──────┼──▶ PredictionTaskStrategy              │
-│              │  "evaluation" ──────┼──▶ EvaluationTaskStrategy              │
-│              │  "infer_uem" ───────┼──▶ UEMPredictionTaskStrategy           │
-│              │  "effectiveEval..."─┼──▶ EffectiveEvaluationTaskStrategy     │
-│              └─────────────────────┘                                        │
-│                       │                                                     │
-│                       ▼                                                     │
-│              根据taskType获取对应Strategy                                    │
-│                       │                                                     │
-│                       ▼                                                     │
-│              TaskCreateStrategy.createTaskPipeline()                        │
-│                       │                                                     │
-│                       ├──▶ 子类实现 ──返回 List<SecondScheduler>            │
-│                                                                             │
-└─────────────────────────────────────────────────────────────────────────────┘
-
-```
-###### 2.6.2.2 工厂实现
-
-
-```java
-@Component
-@RequiredArgsConstructor
-public class TaskGenerationFactory {
-    // Spring自动注入：key=Component名称, value=Bean实例
-    private final Map<String, TaskCreateStrategy> strategyMap;
-    public List<SecondScheduler> createTaskPipeline(final TaskInfo taskInfo) {
-        String taskType = taskInfo.getTaskType();
-        // 根据taskType从Map中获取对应的策略，若不存在则抛异常
-        TaskCreateStrategy taskCreateStrategy = Optional.ofNullable(strategyMap.get(taskType))
-            .orElseThrow(() -> new RuntimeException("no such taskType " + taskType));
-        return taskCreateStrategy.createTaskPipeline(taskInfo);
-    }
-}
-
-```
-
-###### 2.6.2.3 Pipeline 策略接口
-接口定义：
-
-```java
-public interface TaskCreateStrategy {
-    List<SecondScheduler> createTaskPipeline(TaskInfo taskInfo);
-}
-
-```
-通用构建方法：
-
-```java
-public abstract class AbstractTaskCreateStrategy implements TaskCreateStrategy {
-    protected final ITaskDao taskDao;
-    // 通用构建方法：遍历parameter，调用invokeMapper转换后构建子任务
-    protected List<SecondScheduler> buildSchedulersFromParameter(
-            TaskInfo taskInfo, 
-            Function<String, String> invokeMapper) {
-        List<SecondScheduler> secondSchedulers = new ArrayList<>();
-        AtomicInteger index = new AtomicInteger(1);
-        JSONObject parameter = taskInfo.getParameter();
-        
-        parameter.forEach((key, value) -> {
-            String invoke = invokeMapper.apply(key);  // 将key映射为invoke类型
-            if (invoke != null && !invoke.isEmpty()) {
-                int step = index.getAndIncrement();
-                // 调用核心构建方法
-                SecondScheduler scheduler = buildScheduler(taskInfo, invoke, step, (JSONObject) value);
-                secondSchedulers.add(scheduler);
-            }
-        });
-        return secondSchedulers;
-    }
-    // 核心构建逻辑：创建SecondScheduler，初始状态为QUEUING
-    protected SecondScheduler buildScheduler(
-            final TaskInfo taskInfo, 
-            final String invoke, 
-            int step,
-            JSONObject parameter) {
-        return SecondScheduler.builder()
-            .taskId(taskInfo.getTaskId())
-            .batchNo(taskInfo.getBatchNo())
-            .proxy(taskInfo.getProxy())           // 分配的集群代理
-            .taskType(taskInfo.getTaskType())
-            .invoke(invoke)                       // 任务类型标识
-            .parameter(parameter)                 // 任务参数
-            .status(TaskStatus.QUEUING.getStatus())  // 初始状态
-            .step(step)                           // 执行步骤序号
-            .build();
-    }
-}
-
-```
-TrainingTaskStrategy (训练任务)：
-
-
-```java
-@Component("training")  // 注册到strategyMap，key="training"
-public class TrainingTaskStrategy extends AbstractTaskCreateStrategy {
-    
-    @Override
-    public List<SecondScheduler> createTaskPipeline(TaskInfo taskInfo) {
-        // 使用父类的通用构建方法，传入invoke映射函数
-        return buildSchedulersFromParameter(taskInfo, this::getInvoke);
-    }
-    
-    // 根据parameter中的key映射到具体的invoke类型
-    private String getInvoke(String modelName) {
-        return switch (modelName) {
-            case "uem" -> TaskTypeEnum.TRAIN_UEM.getTaskType();   // "train_uem"
-            case "bslm" -> TaskTypeEnum.TRAIN_BSLM.getTaskType(); // "train_bslm"
-            default -> StringUtils.EMPTY;
-        };
-    }
-}
-
-```
-PredictionTaskStrategy (推理任务)：
-
-```java
-@Component("prediction")
-public class PredictionTaskStrategy extends AbstractTaskCreateStrategy {
-    // 固定的任务类型顺序
-    private static final List<String> STDT_TASK_TYPES = ImmutableList.of("cbb", "T0", "srcon_agent");
-    @Override
-    public List<SecondScheduler> createTaskPipeline(TaskInfo taskInfo) {
-        List<SecondScheduler> secondSchedulers = new ArrayList<>();
-        JSONObject parameter = taskInfo.getParameter();
-        
-        // 1. 首先添加RCA推理任务
-        JSONObject rca = parameter.getJSONObject("rca");
-        SecondScheduler scheduler = buildScheduler(taskInfo, TaskTypeEnum.INFER_RCA.getTaskType(), 1, rca);
-        secondSchedulers.add(scheduler);
-        
-        // 2. 根据explainable标志决定是否添加srcon_agent
-        boolean explainable = parameter.getBoolean("explainable");
-        int index = 2;
-        for (String invoke : STDT_TASK_TYPES) {
-            if (!explainable && invoke.equals("srcon_agent")) {
-                continue;  // 不可解释时不添加srcon_agent
-            }
-            // 注意：cbb/T0/srcon_agent使用默认parameter
-            SecondScheduler build = SecondScheduler.builder()
-                .taskId(taskInfo.getTaskId())
-                .batchNo(taskInfo.getBatchNo())
-                .proxy(taskInfo.getProxy())
-                .taskType(taskInfo.getTaskType())
-                .invoke(invoke)
-                .step(index++)
-                .build();
-            secondSchedulers.add(build);
-        }
-        return secondSchedulers;
-    }
-}
-
-```
-
-###### 2.6.2.4 完整时序图
-
-![](./images/pipeline完整流程时序图.PNG)
-
-###### 2.6.2.2 状态同步
-非首次调度时需要进行状态同步。
-
-```
-┌─────────────────────────────────────────────────────────────────────────────┐
-│                        taskStatusSync 状态同步                              │
-├─────────────────────────────────────────────────────────────────────────────┤
-│                                                                             │
-│  输入：主任务状态 status, 子任务列表 secondSchedulers                        │
-│                                                                             │
-│  ┌─────────────────────────────────────────────────────────────────────┐    │
-│  │ for each scheduler in secondSchedulers:                             │    │
-│  │     IF scheduler.status == SUCCESS:                                 │    │
-│  │         continue;  // 已完成的子任务不处理                           │    │
-│  │                                                                     │    │
-│  │     IF 主任务状态 == RUNNING:                                        │    │
-│  │         IF 子任务状态 == QUEUING 或 PENDING:                         │    │
-│  │             break;  // 正常执行，不处理                              │    │
-│  │         IF 子任务状态 == RUN_FAILED 或 STOP:                         │    │
-│  │             子任务状态 = QUEUING;  // 重置为排队中                   │    │
-│  │             isRetryScene = !taskInfo.isBreakpointRetry;             │    │
-│  │             break;                                                   │    │
-│  │                                                                     │    │
-│  │     IF 主任务状态 == RUN_FAILED 或 STOP:                             │    │
-│  │         IF 子任务状态 == QUEUING:                                    │    │
-│  │             子任务状态 = FAILURE;  // 标记为失败                     │    │
-│  │             break;                                                   │    │
-│  │         IF 子任务状态 == PENDING 或 RUNNING:                         │    │
-│  │             子任务状态 = STOP;  // 标记为停止                        │    │
-│  │             break;                                                   │    │
-│  └─────────────────────────────────────────────────────────────────────┘    │
-│                                                                             │
-│  IF isRetryScene:                                                           │
-│      taskParameterSync();  // 同步最新参数                                  │
-│                                                                             │
-└─────────────────────────────────────────────────────────────────────────────┘
-
-```
-
-##### 2.6.3 策略工厂
-每次执行任务都创建新的 SchedulerFactory 。
-###### 2.6.3.1 构建方法
-
-
-```java
-private SchedulerFactory buildSchedulerStrategy(AtomicInteger atomicInteger) {
-    return new SchedulerFactory.Builder()
-        // 策略注册顺序很重要！按优先级从高到低排列
-        .add(new StopStrategy(iInvoke, taskDao))        // 1. 停止策略
-        .add(new SuccessStrategy(iInvoke, atomicInteger)) // 2. 成功策略
-        .add(new QueuingStrategy(iInvoke, taskDao))     // 3. 排队中策略
-        .add(new RunningStrategy(iInvoke))              // 4. 运行中策略
-        .add(new FailedStrategy(iInvoke))               // 5. 失败策略
-        .add(new PendingStrategy(iInvoke))              // 6. 待处理策略
+private RestResponse checkAndSaveTask(final MultipartFile file, final TaskInfo taskInfo) throws Exception {
+    RestResponse response = RestResponse.success();
+    // 构建责任链检查
+    TaskCheckChain checkChain = new TaskCheckChain.Builder()
+        .add(new DataResourceCheckStrategy(gisRestfulUtil, configDao))      // 数据资源检查
+        .add(new MapRoadGridCheckStrategy(gisRestfulUtil, taskDao))         // 路网网格检查
+        .add(new LicenseCheckStrategy(licenseDao, licenseBusiness, licenseFactory, cellQueryBusiness))  // 许可证检查
         .build();
+    checkChain.check(taskInfo, response);
+    
+    if (response.getResultCode() == RestResponse.SUCCESS_CODE) {
+        saveMultipartFile(file, taskInfo);  // 保存标注文件
+        taskDao.saveTask(taskInfo);          // 持久化任务
+    }
+    return response;
 }
-
 ```
-
-###### 2.6.3.2 SchedulerFactory 实现
-
+校验内容详解:
+检查策略	作用
+DataResourceCheckStrategy	检查数据源是否可用、 polygon 覆盖的基站数量等
+MapRoadGridCheckStrategy	检查路网网格划分是否正确、是否有冲突
+LicenseCheckStrategy	检查许可证额度是否足够、场景是否符合
+关键步骤2: 文件保存 saveMultipartFile() (第143行)
 
 ```java
-public record SchedulerFactory(List<SchedulerStrategy> strategies) {
+private void saveMultipartFile(final MultipartFile file, final TaskInfo taskInfo) throws IOException {
+    if (Objects.isNull(file) || file.isEmpty()) {
+        return;  // 可选文件，可能为空
+    }
+    String fileName = file.getOriginalFilename();
+    if (HadoopUtil.isUseHdfs()) {
+        saveToHdfs(file, taskInfo, fileName);
+    } else {
+        saveToLocal(file, taskInfo, fileName);  // 保存到本地磁阵共享目录
+    }
+}
+```
+关键步骤3: 任务持久化 taskDao.saveTask(taskInfo)
+- 插入任务主表 (task_info)
+- 初始化任务状态为 INIT
+---
+## 第三阶段：事件发布与异步处理
+任务保存后，不会同步执行，而是发布 Spring Event 事件：
+事件发布: 任务创建接口 本身不发布事件，事件在周期任务触发时发布
+让我重新梳理正确流程：
+正确的任务触发流程:
+1. 手动创建任务: TaskOperatorService.createTask() → 保存到数据库，状态为 INIT
+2. 周期任务调度: PeriodTaskExecutor.schedule() (第53行)
+
+```java
+      public void schedule() {
+       List<TaskPeriodInfo> taskPeriodInfos = taskDao.queryPeriodInfos();  // 查询周期任务配置
+       for (TaskPeriodInfo periodInfo : taskPeriodInfos) {
+           TaskInfo taskInfo = taskDao.mainTaskInfo(periodInfo.getTaskId());
+           // 检查是否需要执行
+           if (isNeedExecutor(taskType, variableMap, capacityMap)) {
+               processTaskPeriod(periodInfo);  // 处理周期信息
+           }
+       }
+   }
+```
+   
+3. 发布创建事件: processTaskPeriod() (第102行)
+
+```java
+      private void processTaskPeriod(PeriodVariable variable) {
+       for (IPeriodTask periodTask : periodTasks) {
+           if (periodTask.effective(executionMode)) {
+               periodTask.build(periodInfo, taskInfo);
+               break;
+           }
+       }
+       if (periodInfo.isNeedExecutor()) {
+           applicationEventPublisher.publishEvent(new ModelTaskCreateEvent(this, periodInfo));
+       }
+   }
+```
+   
+---
+## 第四阶段：异步消费与智算任务创建
+消费者: ModelTaskCreateConsumer.consumer() (第62行)
+
+```java
+@Async("model-sync")  // 异步执行
+@Override
+@EventListener(value = ModelTaskCreateEvent.class)
+public void consumer(final ModelTaskCreateEvent event) {
+    submitTask(event.getTaskPeriodInfo());
+}
+```
+核心方法: submitTask() (第81行)
+
+```java
+private void submitTask(TaskPeriodInfo taskPeriodInfo) throws Exception {
+    // 1. 获取任务信息
+    TaskInfo taskInfo = taskDao.mainTaskInfo(taskPeriodInfo.getTaskId());
+    taskInfo.setStartDataTime(taskPeriodInfo.getStartDataTime());
+    taskInfo.setEndDataTime(taskPeriodInfo.getEndDataTime());
     
-    /**
-     * 执行策略：遍历所有策略，找到第一个有效的执行
-     */
-    public void execute(SecondScheduler scheduler) {
-        for (SchedulerStrategy strategy : strategies) {
-            if (strategy.isEffective(scheduler)) {  // 判断该策略是否适用于当前子任务
-                strategy.handle(scheduler);          // 执行策略处理
-                break;                                // 执行后立即break，不继续匹配
+    // 2. 读取Pipeline配置
+    String modelLowerCase = taskInfo.getModelName().toLowerCase(Locale.ROOT);
+    String fileName = "TaskPipeline-" + modelLowerCase + ".json";
+    Map<String, Object> script = taskDao.getScript(modelLowerCase, FileModule.PIPELINE.getType(), fileName);
+    
+    // 3. 执行策略链
+    TaskGenerationStrategyChain strategyChain = new TaskGenerationStrategyChain(...);
+    strategyChain.execute(taskInfo, json);  // 核心创建逻辑
+    
+    // 4. 更新主任务状态为 RUNNING
+    taskDao.updateMainTaskStatus(taskInfo.getTaskId(), TaskStatus.RUNNING.getStatus());
+}
+```
+
+---
+## 第五阶段：策略链构建Pipeline
+策略链: TaskGenerationStrategyChain.execute() (第45行)
+
+```java
+public void execute(TaskInfo taskInfo, JSONObject config) throws Exception {
+    // 责任链: RatStrategy → ModelStrategy → PipelineStrategy
+    strategy.generateAndSubmitTasks(taskInfo, config, taskInfo.getRat(), taskInfo.getModels());
+}
+核心Pipeline策略: PipelineStrategy.generateAndSubmitTasks() (第90行)
+public void generateAndSubmitTasks(final TaskInfo taskInfo, final JSONObject config, 
+    final String rat, final JSONObject model) throws Exception {
+    createSubTask(taskInfo, config, rat, model);
+}
+```
+
+---
+## 第六阶段：创建智算任务与二级调度器
+核心方法: createSubTask() (第95行)
+
+```java
+private void createSubTask(final TaskInfo taskInfo, final JSONObject json, 
+    final String rat, final JSONObject model) throws Exception {
+    
+    // ====== 关键步骤1: 调用智算侧API创建任务 ======
+    ImmutableTriple<String, String, Long> intelligentTrip = createIntelligentTask(taskInfo);
+    String subTaskId = intelligentTrip.left;  // 智算侧返回的subTaskId
+    
+    // ====== 构建Pipeline二级调度器 ======
+    MutablePair<List<SecondScheduler>, List<TaskData>> pair = buildPipeline(taskInfo, json, subTaskId, model);
+    List<SecondScheduler> secondSchedulers = pair.left;
+    
+    // ====== 数据筛选（根据配置）======
+    if (taskInfo.getDatasetOnly()) {
+        secondSchedulers.removeIf(...)  // 仅保留数据集生成流水线
+    }
+    if (!HadoopUtil.isUseHdfs()) {
+        secondSchedulers.removeIf(Invoke::isDownload);  // 移除下载步骤
+    }
+    
+    // ====== 插入数据库 ======
+    taskDao.insertSecondSchedulers(secondSchedulers);  // 二级调度器列表
+    taskDao.insertTaskData(pair.right);                 // 任务数据
+    
+    // ====== 创建子任务记录 ======
+    SubTaskParameter subTaskParameter = new SubTaskParameter(taskInfo, intelligentTrip, rat, model, pair.right);
+    taskDao.addSubTask(builderSubTaskInfo(subTaskParameter));
+}
+```
+
+---
+## 第七阶段：调用智算侧API
+核心方法: createIntelligentTask() (第123行)
+
+```java
+private ImmutableTriple<String, String, Long> createIntelligentTask(final TaskInfo taskInfo) throws IOException {
+    // 1. 构建请求参数
+    JSONObject input = buildCreateTaskParameter(taskInfo);
+    
+    // 2. 调用智算侧API
+    JSONObject response = ApiFabricUtil.sendPostJsonRequest(createTask, input, taskInfo.getTaskType());
+    
+    // 3. 解析响应
+    if (resultCode == 0) {
+        String subTaskId = data.getString("subTaskId");
+        String sftpMountPrefix = data.getString("sftpMountPrefix");
+        long intelligentSystemTime = data.getLongValue("systemTime");
+        return new ImmutableTriple<>(subTaskId, sftpMountPrefix, intelligentSystemTime);
+    } else {
+        // 失败处理
+        handlerWhenCreateIntelligentTaskFailed(taskInfo, subTaskId, errno, resultCode);
+        throw new ModelException("createIntelligentTask failed");
+    }
+}
+```
+请求参数构建 buildCreateTaskParameter() (第170行):
+
+```java
+private JSONObject buildCreateTaskParameter(final TaskInfo taskInfo) {
+    JSONObject cell = statisticsCellNumber(taskInfo.getPolygon(), taskInfo);
+    return new JSONObject()
+        .fluentPut("taskId", taskInfo.getTaskId())
+        .fluentPut("taskType", taskInfo.getTaskType())
+        .fluentPut("storeLoc", taskInfo.getStoreLoc())
+        .fluentPut("polygonName", ...)      // 多边形名称
+        .fluentPut("cellCount", cell)       // 基站统计
+        .fluentPut("rat", taskInfo.getRat())
+        .fluentPut("osType", ...)
+        .fluentPut("model", taskInfo.getModels());
+}
+```
+---
+## 第八阶段：构建二级调度器
+核心方法: buildPipeline() (第258行)
+
+```java
+private MutablePair<List<SecondScheduler>, List<TaskData>> buildPipeline(...) {
+    JSONArray jsonArray = json.getJSONArray("pipeline");  // 从配置读取流水线定义
+    List<SecondScheduler> pipelines = createSecondSchedulers(taskInfo, jsonArray, subTaskId);
+    TaskData taskData = createTaskData(taskInfo, subTaskId, model);
+    
+    // 根据是否按Polygon分批，决定单批次或多批次
+    boolean isSplitByPolygon = json.getBooleanValue("is-split-by-cell");
+    return isSplitByPolygon
+        ? createMultiBatchSchedulersAndTaskData(...)  // 多批次
+        : createSingleBatchSchedulersAndTaskData(...); // 单批次
+}
+```
+调度器创建 createSecondSchedulers() (第338行):
+
+```java
+private List<SecondScheduler> createSecondSchedulers(...) {
+    for (JSONObject object : jsonArray) {
+        SecondScheduler secondScheduler = JSON.to(SecondScheduler.class, object);
+        secondScheduler.setTaskId(subTaskId);
+        secondScheduler.setRat(taskInfo.getRat());
+        secondScheduler.setBatchNo(1);
+        secondScheduler.setModel(taskInfo.getModels());
+        processSecondScheduler(taskInfo, secondScheduler, atomicInteger, pipelines);
+    }
+}
+```
+批量处理:
+- 如果 isRatBatch=true: 按RAT分裂（如NR、LTE分开执行）
+- 如果 isModelBatch=true: 按模型分裂（如uem、bslm分开执行）
+---
+## 完整时序图
+
+```
+用户请求 POST /task/v1/task-add
+    │
+    ▼
+TaskOperatorController.addTask()
+    │
+    ▼
+TaskOperatorService.createTask()
+    │
+    ├─→ taskDao.generateTaskId() 生成任务ID
+    │
+    ├─→ TaskCheckChain 检查
+    │   ├─→ DataResourceCheckStrategy
+    │   ├─→ MapRoadGridCheckStrategy
+    │   └─→ LicenseCheckStrategy
+    │
+    ├─→ saveMultipartFile() 保存标注文件到HDFS/本地
+    │
+    └─→ taskDao.saveTask() 持久化任务（状态=INIT）
+    │
+    ▼
+[周期调度器触发] PeriodTaskExecutor.schedule()
+    │
+    ▼
+[发布事件] ModelTaskCreateEvent
+    │
+    ▼
+[异步消费] ModelTaskCreateConsumer.consumer()
+    │
+    ├─→ taskDao.getScript() 读取Pipeline配置
+    │
+    ▼
+TaskGenerationStrategyChain.execute()
+    │
+    ▼
+PipelineStrategy.generateAndSubmitTasks()
+    │
+    ├─→ createIntelligentTask() 调用智算API创建任务
+    │   └─→ ApiFabricUtil.sendPostJsonRequest(createTask, ...)
+    │       └─→ 返回 subTaskId, sftpMountPrefix
+    │
+    ├─→ buildPipeline() 构建二级调度器
+    │   ├─→ createSecondSchedulers() 解析pipeline配置
+    │   ├─→ processIfProcessByHour() 流式处理
+    │   └─→ processIfPredictionExplainable() 可解释性
+    │
+    ├─→ taskDao.insertSecondSchedulers() 保存调度器
+    │
+    ├─→ taskDao.addSubTask() 创建子任务记录
+    │
+    └─→ taskDao.updateMainTaskStatus(RUNNING)
+    │
+    ▼
+[定时调度] TaskStatusExecutor.schedule()
+    │
+    ├─→ 查询未完成的子任务
+    │
+    └─→ SchedulerChain 处理
+        ├─→ QueuingStrategy → IntelligentInvokeExecutor.execute()
+        └─→ RunningStrategy → IntelligentInvokeExecutor.status()
+```
+
+## 概念澄清：主任务、子任务、Pipeline、SecondScheduler
+### 1. TaskInfo（主任务）
+定义: 用户提交的完整任务，包含所有执行所需参数
+
+```
+TaskInfo {
+    taskId              // 任务ID（用户或系统生成）
+    taskName            // 任务名称
+    taskType            // 任务类型：TRAINING/PREDICTION/EVALUATION
+    modelName           // 模型名称
+    rat                 // 无线接入类型：NR/LTE/NR,LTE
+    polygon             // 地理区域列表
+    models              // 模型配置JSON（包含uem、bslm等模型版本）
+    startDataTime       // 数据开始时间
+    endDataTime         // 数据结束时间
+    explainable         // 是否可解释
+    datasetOnly         // 是否仅生成数据集
+    ...
+}
+```
+特点: 
+- 一个用户请求创建一个 TaskInfo
+- 是任务创建的入口实体
+- 包含完整的业务参数
+---
+### 2. SubTaskInfo（子任务）
+定义: 调用智算侧API后，智算侧返回的实际执行单元
+
+```
+SubTaskInfo {
+    taskId              // 关联的主任务ID
+    subTaskId           // 智算侧返回的子任务ID（全局唯一）
+    subTaskStatus       // 子任务状态
+    startDataTime       // 数据开始时间
+    endDataTime         // 数据结束时间
+    subModel            // 子任务使用的模型配置
+    subRat              // 子任务使用的RAT类型
+    sftpMountPrefix     // 智算侧返回的SFTP挂载路径
+    ...
+}
+```
+创建时机: PipelineStrategy.createIntelligentTask() (第123行)
+
+```java
+// 调用智算侧API
+JSONObject response = ApiFabricUtil.sendPostJsonRequest(createTask, input, taskInfo.getTaskType());
+// 智算侧返回 subTaskId
+String subTaskId = data.getString("subTaskId");
+```
+什么时候一个主任务会产生多个子任务:
+场景	触发条件	结果
+按Polygon分裂	isSplitByCell=true 且基站的cell数量超过限制	每个分裂的polygon生成一个SubTaskInfo，但共用同一个subTaskId + 不同batchNo
+
+**注意: 代码中实际上一个主任务通常只创建一个SubTaskInfo，但会在内部按 batchNo 分成多个批次**
+
+#### 举例说明
+假设任务需求：
+- 覆盖区域有 3 个 Polygon（P1、P2、P3）
+- 每个 Polygon 包含的基站数量总和超过了系统限制（cellLimit）
+- Pipeline 配置：is-split-by-cell: true
+分批过程
+
+```java
+// PipelineStrategy.splitPolygon() - 按cellLimit分裂Polygon
+splitPolygon(taskInfo):
+    polygon列表: [P1, P2, P3]
+    cellLimit: 1000
+    
+    // 假设 P1有400基站，P2有500基站，P3有300基站
+    // P1+P2=900 <= 1000，可以合并
+    // P1+P2+P3=1200 > 1000，需要分裂
+    
+    结果: [[P1, P2], [P3]]  // 分成2个批次
+```
+生成的 SecondScheduler 结构
+
+```
+SubTaskInfo:
+    taskId: "TASK_001"
+    subTaskId: "SUB_123"  (智算侧返回，全局唯一)
+```
+    
+SecondScheduler列表:
+
+```
+    ┌─────────────────────────────────────────────────────────────┐
+    │ batchNo = 1                                                │
+    │   SecondScheduler(subTaskId="SUB_123", batchNo=1, step=1)  │
+    │   SecondScheduler(subTaskId="SUB_123", batchNo=1, step=2)  │
+    │   SecondScheduler(subTaskId="SUB_123", batchNo=1, step=3)  │
+    │   ...                                                      │
+    ├─────────────────────────────────────────────────────────────┤
+    │ batchNo = 2                                                │
+    │   SecondScheduler(subTaskId="SUB_123", batchNo=2, step=1)  │
+    │   SecondScheduler(subTaskId="SUB_123", batchNo=2, step=2)  │
+    │   SecondScheduler(subTaskId="SUB_123", batchNo=2, step=3)  │
+    │   ...                                                      │
+    └─────────────────────────────────────────────────────────────┘
+```
+
+|维度	|说明|
+|--|--|
+|subTaskId|	全局唯一，智算侧识别一个任务的标识|
+|batchNo|	本地分批编号，用于控制执行顺序和数据隔离|
+|关系|	1个 subTaskId → N个 batchNo|
+|执行	|串行执行，只有上一batch全部成功，下一batch才开始|
+|原因	|控制单次处理的数据量，避免资源耗尽|
+
+**一句话概括**: 智算侧只知道一个任务(subTaskId)，但本地平台为了可控执行，把这个任务分成了多个批次(batchNo)，每个批次处理一部分数据，必须按顺序执行。
+
+---
+### 3. Pipeline（流水线配置）
+定义: 声明式的任务执行流程配置文件
+存储位置: ModelTaskCreateConsumer 从数据库读取
+
+```java
+String fileName = "TaskPipeline-" + modelLowerCase + ".json";
+Map<String, Object> script = taskDao.getScript(modelLowerCase, FileModule.PIPELINE.getType(), fileName);
+```
+配置：
+Pipeline配置存储在JSON文件中，配置示例结构:
+
+```json
+{
+  "training": {
+    "is-multi-rat-task": true,
+    "is-multi-model-task": true,
+    "is-split-by-cell": false,
+    "pipeline": [
+      {
+        "invoke": "dataSetProcessing",
+        "descZh": "数据集加工",
+        "descEn": "DataSetProcessing",
+        "ratBatch": true,
+        "modelBatch": false
+      },
+      {
+        "invoke": "upload",
+        "descZh": "上传",
+        "descEn": "Upload",
+        "ratBatch": true,
+        "modelBatch": false
+      },
+      {
+        "invoke": "modelTrain",
+        "descZh": "增训",
+        "descEn": "Train",
+        "ratBatch": false,
+        "modelBatch": true
+      },
+      {
+        "invoke": "download",
+        "descZh": "下载",
+        "descEn": "download",
+        "ratBatch": false,
+        "modelBatch": false
+      },
+      {
+        "invoke": "evaluateResult",
+        "descZh": "评估结果处理",
+        "descEn": "download",
+        "ratBatch": false,
+        "modelBatch": false
+      }
+    ]
+  },
+  "prediction": {
+    "is-multi-rat-task": true,
+    "is-multi-model-task": true,
+    "is-split-by-cell": true,
+    "pipeline": [
+      {
+        "invoke": "dataSetProcessing",
+        "descZh": "数据集加工",
+        "descEn": "DataSetProcessing",
+        "ratBatch": true,
+        "modelBatch": false,
+        "isProcessByHour": true
+      },
+      {
+        "invoke": "upload",
+        "descZh": "上传",
+        "descEn": "Upload",
+        "ratBatch": true,
+        "modelBatch": false,
+        "isProcessByHour": true
+      },
+      {
+        "invoke": "modelInference",
+        "descZh": "推理",
+        "descEn": "modelInference",
+        "ratBatch": false,
+        "modelBatch": false
+      },
+      {
+        "invoke": "download",
+        "descZh": "下载",
+        "descEn": "download",
+        "ratBatch": false,
+        "modelBatch": false
+      },
+      {
+        "invoke": "cbbProcessing",
+        "descZh": "后置处理",
+        "descEn": "cbbProcessing",
+        "ratBatch": false,
+        "modelBatch": false
+      }
+    ]
+  },
+  "evaluation": {
+    "is-multi-rat-task": true,
+    "is-multi-model-task": true,
+    "is-split-by-cell": false,
+    "pipeline": [
+      {
+        "invoke": "dataSetProcessing",
+        "descZh": "数据集加工",
+        "descEn": "DataSetProcessing",
+        "ratBatch": true,
+        "modelBatch": false
+      },
+      {
+        "invoke": "upload",
+        "descZh": "上传",
+        "descEn": "Upload",
+        "ratBatch": true,
+        "modelBatch": false
+      },
+      {
+        "invoke": "modelEvaluation",
+        "descZh": "评估",
+        "descEn": "Train",
+        "ratBatch": false,
+        "modelBatch": true
+      },
+      {
+        "invoke": "download",
+        "descZh": "下载",
+        "descEn": "download",
+        "ratBatch": false,
+        "modelBatch": false
+      },
+      {
+        "invoke": "evaluateResult",
+        "descZh": "评估结果处理",
+        "descEn": "download",
+        "ratBatch": false,
+        "modelBatch": false
+      }
+    ]
+  }
+}
+```
+
+---
+
+### 4. SecondScheduler（二级调度器）
+定义: Pipeline中每个步骤的执行单元，是**调度器实际处理的最小单位**
+
+```
+SecondScheduler {
+    taskId              // 实际是subTaskId（智算侧返回）
+    batchNo             // 批次号（按polygon分裂时有多批次）
+    step                // 步骤序号（1, 2, 3...）
+    invoke              // 执行类型：download/intelligent/upload/paramInit
+    rat                 // 无线接入类型：NR/LTE
+    model               // 模型配置JSON
+    status              // 当前状态：QUEUING/RUNNING/SUCCESS/FAILURE
+    ...
+}
+```
+创建过程: PipelineStrategy.buildPipeline() (第258行)
+
+```
+Pipeline JSON配置
+    │
+    ▼
+createSecondSchedulers() 解析pipeline数组
+    │
+    ▼
+processSecondScheduler() 处理RAT分裂
+    │
+    ▼
+processModelBatch() 处理模型分裂
+    │
+    ▼
+createMultiBatchSchedulersAndTaskData() 处理Polygon分裂
+    │
+    ▼
+最终 SecondScheduler 列表
+```
+---
+#### 四者关系图
+
+```
+用户提交请求
+    │
+    ▼
+┌─────────────────────────────────────┐
+│           TaskInfo (主任务)          │
+│  polygon: [P1, P2, P3]              │
+│  rat: "NR,LTE"                      │
+│  models: {uem: "v1", bslm: "v2"}    │
+│  taskType: "TRAINING"               │
+└─────────────────────────────────────┘
+    │
+    │ 调用智算侧API创建任务
+    ▼
+┌─────────────────────────────────────┐
+│        SubTaskInfo (子任务)          │
+│  taskId: 主任务ID                    │
+│  subTaskId: 智算侧返回的ID           │
+│  subModel: {uem: "v1", bslm: "v2"}  │
+│  subRat: "NR,LTE"                   │
+└─────────────────────────────────────┘
+    │
+    │ 读取Pipeline配置
+    ▼
+┌─────────────────────────────────────┐
+│   Pipeline 配置                      │
+│   isSplitByCell: true               │
+│   pipeline: [                       │
+│     {invoke: "paramInit", step: 1}, │
+│     {invoke: "download", step: 2},  │
+│     {invoke: "intelligent",         │
+│      step: 3, isModelBatch: true},  │
+│     {invoke: "upload", step: 4}     │
+│   ]                                 │
+└─────────────────────────────────────┘
+    │
+    │ 构建二级调度器（分裂规则应用）
+    ▼
+┌─────────────────────────────────────────────────────────────┐
+│                   SecondScheduler 列表                       │
+│                                                              │
+│  batchNo=1:                                                  │
+│    SecondScheduler(subTaskId, batch=1, step=1, invoke=paramInit)│
+│    SecondScheduler(subTaskId, batch=1, step=2, invoke=download)│
+│    SecondScheduler(subTaskId, batch=1, step=3, invoke=intelligent, model=uem)│
+│    SecondScheduler(subTaskId, batch=1, step=4, invoke=intelligent, model=bslm)│
+│    SecondScheduler(subTaskId, batch=1, step=5, invoke=upload) │
+│                                                              │
+│  batchNo=2:  (如果polygon需要分裂)                            │
+│    SecondScheduler(subTaskId, batch=2, step=1, invoke=paramInit)│
+│    SecondScheduler(subTaskId, batch=2, step=2, invoke=download)│
+│    ...                                                       │
+└─────────────────────────────────────────────────────────────┘
+```
+---
+#### 分裂详解
+1. Polygon分裂 (is-split-by-cell: true)
+
+```java
+// PipelineStrategy.createMultiBatchSchedulersAndTaskData() 第276行
+for (int index = 0; index < polygons.size(); index++) {
+    int batchNo = index + 1;
+    for (SecondScheduler scheduler : pipelines) {
+        SecondScheduler clone = scheduler.clone();
+        clone.setBatchNo(batchNo);  // 设置批次号
+        list.add(clone);
+    }
+}
+```
+场景: 如果一个任务覆盖的基站数量太多（超过cellLimit），会按Polygon分成多个batch并行执行
+2. RAT分裂 (isRatBatch: true)
+
+```java
+// PipelineStrategy.processSecondScheduler() 第356行
+if (secondScheduler.isRatBatch()) {
+    for (String subRat : rat.split(",")) {
+        SecondScheduler clone = secondScheduler.clone();
+        clone.setRat(subRat);  // NR 或 LTE 分开
+        processModelBatch(clone, atomicInteger, pipelines);
+    }
+}
+```
+3. 模型分裂 (isModelBatch: true)
+
+```java
+// PipelineStrategy.processModelBatch() 第370行
+if (secondScheduler.isModelBatch()) {
+    for (String key : collect) {
+        JSONObject subModel = new JSONObject().fluentPut(key, model.getString(key));
+        SecondScheduler clone = secondScheduler.clone();
+        clone.setModel(subModel);  // uem 和 bslm 分开
+        clone.setStep(atomicInteger.incrementAndGet());
+        pipelines.add(clone);
+    }
+}
+```
+---
+总结
+|概念	|作用|	数量关系|
+|--|--|--|
+|TaskInfo	|用户提交的完整任务，保存到task_info表|	1个用户请求 = 1个TaskInfo|
+|SubTaskInfo	|智算侧返回的实际执行单元，关联TaskInfo，保存到sub_task_info表|	1个TaskInfo = 1个或N个SubTaskInfo（按polygon分裂时）|
+|Pipeline	|JSON配置文件，定义执行步骤流程|	被TaskInfo.taskType引用|
+|SecondScheduler|	Pipeline步骤的执行单元，保存到second_scheduler表|	1个SubTaskInfo = N×M个SecondScheduler（N=batch数，M=步骤数×模型分裂数）|
+
+**一句话总结**: 
+TaskInfo是任务容器，SubTaskInfo是智算执行单元，Pipeline是执行步骤模板，SecondScheduler是步骤实例。Pipeline配置决定了SubTaskInfo要创建哪些SecondScheduler，以及是否按RAT/模型/Polygon进行分裂。
+
+
+# 任务执行详细流程
+
+## 调度器入口
+TaskStatusExecutor 实现 IScheduler 接口，被 Spring 的 @Scheduled(cron = "0 */1 * * * *") 驱动，每分钟执行一次。
+
+```java
+// TaskStatusExecutor 第53行
+@Override
+public void schedule() {
+    try {
+        redisLock.lockAndWait(TASK_PERIOD_EXECUTOR_KEY, ILock.LOCK_EXPIRE_TIME);
+        doSchedule();  // 核心逻辑
+    } finally {
+        redisLock.unlock(TASK_PERIOD_EXECUTOR_KEY);
+    }
+}
+```
+---
+## 执行流程详解
+### 步骤1：查询未完成的子任务
+
+```java
+// TaskStatusExecutor.doSchedule() 第102行
+private void doSchedule() {
+    // 查询所有未完成（状态非SUCCESS/FAILURE/STOP）的子任务
+    List<SubTaskInfo> subTaskInfos = taskDao.queryNoCompleteSubTasks();
+    
+    if (CollectionUtils.isEmpty(subTaskInfos)) {
+        return;  // 没有待处理任务，直接返回
+    }
+    
+    // 线程池并行处理每个子任务
+    ExecutorService executor = ThreadPoolFactory.INSTANCE.get();
+    CountDownLatch latch = new CountDownLatch(subTaskInfos.size());
+    
+    for (SubTaskInfo subTaskInfo : subTaskInfos) {
+        CompletableFuture.runAsync(() -> execute(subTaskInfo, latch), executor);
+    }
+}
+```
+---
+
+### 步骤2：执行单个子任务
+
+```java
+// TaskStatusExecutor.execute() 第149行
+private void execute(final SubTaskInfo subTaskInfo, final CountDownLatch latch) {
+    try {
+        // 查询该子任务下的所有SecondScheduler
+        List<SecondScheduler> secondSchedulers = subTaskInfo.getSchedulerList();
+        
+        // 按batchNo分组
+        Map<Integer, List<SecondScheduler>> map = groupSchedulersByBatchNo(secondSchedulers);
+        
+        // 构建策略链
+        AtomicInteger atomicInteger = new AtomicInteger(0);
+        SchedulerChain chain = buildSchedulerChain(atomicInteger);
+        
+        // 按批次顺序处理
+        for (Map.Entry<Integer, List<SecondScheduler>> entry : map.entrySet()) {
+            processBatch(subTaskInfo, entry.getValue(), chain, atomicInteger);
+            
+            // 如果当前批次失败，跳出不再处理后续批次
+            if (shouldStopProcessing(subTaskInfo.getSubTaskId(), entry.getKey())) {
+                break;
             }
         }
+        
+        // 更新子任务最终状态
+        updateSubTaskStatus(subTaskInfo, atomicInteger, secondSchedulers);
+    } finally {
+        latch.countDown();
     }
 }
-
 ```
-
-###### 2.6.3.3 子任务遍历执行示意图
-
-
-```
-Pipeline子任务列表: [train(QUEUING), infer_rca(QUEUING), cbb(QUEUING)]
-                    ↓
-┌─────────────────────────────────────────────────────────────────────────────┐
-│                     遍历执行第一个子任务 train                               │
-├─────────────────────────────────────────────────────────────────────────────┤
-│                                                                             │
-│  preStatus = "QUEUING"                                                       │
-│       ↓                                                                     │
-│  schedulerFactory.execute(scheduler)                                        │
-│       ↓                                                                     │
-│  遍历策略列表:                                                               │
-│       ├─ StopStrategy: isStop(QUEUING) = false  → 跳过                      │
-│       ├─ SuccessStrategy: isSuccess(QUEUING) = false → 跳过                │
-│       ├─ QueuingStrategy: isQueuing(QUEUING) = TRUE  → 执行！               │
-│       │      └─ invoke.start() → 启动任务                                   │
-│       │      └─ scheduler.setStatus("running")                             │
-│       │      └─ atomicInteger.getAndIncrement() (如果成功)                  │
-│       └─ break; 不再匹配后续策略                                             │
-│       ↓                                                                     │
-│  shouldBreakAfterStrategy(running) → false → 不中断                         │
-│       ↓                                                                     │
-│  updateSecondScheduler() → 更新到数据库                                      │
-│       ↓                                                                     │
-│  shouldBreakAfterUpdate(running) → true → BREAK退出循环                     │
-│       ↓                                                                     │
-│  ⚠️ 注意：只处理了第一个子任务train，后面两个infer_rca和cbb未处理！           │
-│                                                                             │
-└─────────────────────────────────────────────────────────────────────────────┘
-
-```
-###### 2.6.3.4 各策略处理逻辑
-
-| 策略  | 处理逻辑  |
-| ------------ | ------------ |
-| StopStrategy  | 调用 invoke.stop() 停止任务  |
-| SuccessStrategy  |  计数器 +1，不做其他处理 |
-| QueuingStrategy  | 调用 invoke.start() 启动任务，构造参数，处理断点续训  |
-| RunningStrategy  |  调用 invoke.status() 查询状态，更新结束时间 |
-| FailedStrategy  | 记录错误日志  |
-| PendingStrategy  | 调用 invoke.status() 查询状态  |
-
-
-
-为什么每个任务要创建独立的 SchedulerFactory？
-因为 SuccessStrategy 内部引用了 AtomicInteger：
+---
+### 步骤3：策略链处理单个批次
 
 ```java
-public class SuccessStrategy extends AbstractSchedulerStrategy {
-    private final AtomicInteger atomicInteger;  // 用于计数成功的子任务数
+// TaskStatusExecutor.processBatch() 第206行
+private void processBatch(final SubTaskInfo subTaskInfo, 
+    final List<SecondScheduler> batchPipelines, 
+    final SchedulerChain chain,
+    final AtomicInteger atomicInteger) {
     
-    public SuccessStrategy(final IInvoke invoke, AtomicInteger atomicInteger) {
-        super(invoke);
-        this.atomicInteger = atomicInteger;
-    }
+    // 按step排序，确保步骤顺序执行
+    batchPipelines.sort(Comparator.comparingInt(SecondScheduler::getStep));
     
-    @Override
-    public void handle(final SecondScheduler scheduler) {
-        atomicInteger.getAndIncrement();  // 子任务成功时+1
-    }
-}
-```
-
-#### 2.7 调用执行层 (IInvoke / IntelligentInvoke)
-
-核心接口：
-
-```
-public interface IInvoke {
-    String start(SecondScheduler scheduler, boolean isBreakpointRetry);  // 启动任务
-    String status(SecondScheduler scheduler);  // 查询状态
-    String stop(SecondScheduler scheduler);    // 停止任务
-}
-```
-##### 2.7.1 整体架构
-
-```
-┌─────────────────────────────────────────────────────────────────────────────┐
-│                        IInvoke 工厂方法                                      │
-├─────────────────────────────────────────────────────────────────────────────┤
-│                                                                             │
-│  QueuingStrategy.handle()                         │
-│         │                                                                   │
-│         └─▶ IntelligentInvoke.start(scheduler, isBreakpointRetry)          │
-│                       │                                                     │
-│                       ▼                                                     │
-│           ┌────────────────────────┐                                        │
-│           │  getBuilder(invoke)    │  工厂方法：根据invoke类型              │
-│           │  ────────────────────  │  选择对应的ParameterBuilder           │
-│           │  "train_uem" ──────────┼──▶ TrainParameterBuilder              │
-│           │  "train_bslm" ─────────┼──▶ TrainParameterBuilder              │
-│           │  "infer_rca" ──────────┼──▶ RcaInferParameterBuilder           │
-│           │  "infer_uem" ──────────┼──▶ UemInferParameterBuilder           │
-│           │  "evaluate_uem" ───────┼──▶ EvaluationParameterBuilder         │
-│           │  "evaluate_bslm" ──────┼──▶ EvaluationParameterBuilder         │
-│           │  "cbb" ────────────────┼──▶ CBBProcessParameterBuilder         │
-│           │  "T0" ─────────────────┼──▶ CBBProcessParameterBuilder         │
-│           │  "effectiveEvaluation"─┼──▶ CBBProcessParameterBuilder         │
-│           │  "srcon_agent" ────────┼──▶ ExplainParameterBuilder            │
-│           └────────────────────────┘                                        │
-│                       │                                                     │
-│                       ▼                                                     │
-│           ParameterBuilder.buildStart(intelligentRecord, isContinue)       │
-│                       │                                                     │
-│                       ├──▶ 构建请求URL                                       │
-│                       └──▶ 构建请求体 (JSONObject)                           │
-│                                                                             │
-│                       │                                                     │
-│                       ▼                                                     │
-│           RestRecord execRecord = new RestRecord(url, body, proxy)         │
-│                       │                                                     │
-│                       ▼                                                     │
-│           RestUtil.sendPostJsonRequest(execRecord)  ──HTTP POST──▶ 智算侧   │
-│                                                                             │
-└─────────────────────────────────────────────────────────────────────────────┘
-
-```
-
-##### 2.7.2 start 方法完整流程
-
-
-```java
-@Override
-public String start(final SecondScheduler scheduler, final boolean isBreakpointRetry) {
-    // ============================================================
-    // 步骤1：选择对应的ParameterBuilder
-    // ============================================================
-    ParameterBuilder builder = getBuilder(scheduler.getInvoke());
-    
-    // ============================================================
-    // 步骤2：构建调用上下文记录
-    // ============================================================
-    IntelligentRecord intelligentRecord = new IntelligentRecord(
-        scheduler, intelligentApi, taskDao, metricTaskDao, srconTaskDao);
-    
-    // ============================================================
-    // 步骤3：构建请求URL和请求体
-    // ============================================================
-    ImmutablePair<String, JSONObject> pair = builder.buildStart(intelligentRecord, isBreakpointRetry);
-    if (pair == null || StringUtils.isEmpty(pair.left) || pair.right == null) {
-        log.error("Intelligent parameter build failed!!");
-        TaskErrorCodeEnum errorCode = builder.buildErrno(scheduler.getInvoke(), true, false);
-        updateErrno(scheduler, errorCode.getErrno());
-        return TaskStatus.FAILURE.getStatus();
-    }
-    
-    // ============================================================
-    // 步骤4：构建HTTP请求记录
-    // ============================================================
-    RestRecord execRecord = new RestRecord(pair.left, pair.right, scheduler.getProxy());
-    log.warn("invoke start: {}", JSON.toJSONString(pair));
-    
-    // ============================================================
-    // 步骤5：发送HTTP请求到智算侧
-    // ============================================================
-    JSONObject response = RestUtil.sendPostJsonRequest(execRecord);
-    
-    // ============================================================
-    // 步骤6：更新错误码
-    // ============================================================
-    updateStartErrno(scheduler, builder, response);
-    
-    // ============================================================
-    // 步骤7：判断请求是否成功
-    // ============================================================
-    if (!isInvokeSuccess(response)) {
-        log.error("Intelligent start error: {}", JSON.toJSONString(scheduler));
-        return TaskStatus.FAILURE.getStatus();
-    }
-    
-    // ============================================================
-    // 步骤8：保存任务结果
-    // ============================================================
-    ModelTaskResult modelTaskResult = buildModelTaskResult(scheduler, response);
-    taskDao.saveModelTaskResult(modelTaskResult);
-    
-    return TaskStatus.RUNNING.getStatus();
-}
-
-```
-
-##### 2.7.3 完整时序图
-
-![](./images/invoke完整时序图.PNG)
-
-
-
-
-#### 2.8 调度场景分析
-
-
-```
-┌─────────────────────────────────────────────────────────────────────────────┐
-│                           正常任务调度完整流程                                │
-├─────────────────────────────────────────────────────────────────────────────┤
-│                                                                             │
-│  【用户操作阶段】                                                             │
-│  createTask() ──→ INIT                                                     │
-│  startTask()  ──→ QUEUING                                                  │
-│                                                                             │
-│  【第一调度周期】 (SrconTaskScheduler 每10秒)                                 │
-│  queryTasksByStatus(QUEUING) ──→ allocateClusterResource() ──→ RUNNING     │
-│                                   (分配集群资源)                              │
-│                                                                             │
-│  【第一调度周期】 (TaskStatusExecutor cron配置时间)                           │
-│  queryRunningTasks() ──→ getSecondSchedulers()                              │
-│                          ├─ 若无pipeline: createTaskPipeline()              │
-│                          │     └─ 所有子任务 status=QUEUING                 │
-│                          └─ 若有pipeline: taskStatusSync()                  │
-│                                                                             │
-│  遍历子任务:                                                                 │
-│  ├─ 子任务1 (QUEUING) → QueuingStrategy.handle()                            │
-│  │     ├─ buildSchedulerParameter()                                         │
-│  │     ├─ invoke.start() ──→ HTTP到智算侧 ──→ "running"                    │
-│  │     └─ 子任务状态 → RUNNING                                              │
-│  │                                                                         │
-│  └─ 子任务2 (QUEUING) → QueuingStrategy.handle()                            │
-│        ├─ buildSchedulerParameter()                                         │
-│        ├─ invoke.start() ──→ HTTP到智算侧 ──→ "running"                    │
-│        └─ 子任务状态 → RUNNING                                              │
-│                                                                             │
-│  【后续调度周期】 (10秒后/下次cron)                                           │
-│  queryRunningTasks() ──→ 主任务状态仍=RUNNING                                │
-│                                                                             │
-│  子任务状态同步:                                                             │
-│  ├─ train (RUNNING) → RunningStrategy.handle()                              │
-│  │     └─ invoke.status() ──→ 查询智算侧状态                                 │
-│  │                                                                          │
-│  ├─ infer_rca (QUEUING) → QueuingStrategy.handle()                          │
-│  │     └─ invoke.start() ──→ 启动推理                                        │
-│  │                                                                          │
-│  └─ cbb (QUEUING) → QueuingStrategy.handle()                                │
-│        └─ invoke.start() ──→ 启动后处理                                      │
-│                                                                             │
-│  【所有子任务成功时】                                                         │
-│  主任务状态 ──→ SUCCESS                                                     │
-│                                                                             │
-└─────────────────────────────────────────────────────────────────────────────┘
-
-```
-
-## 二、策略模式解决的核心问题
-问题场景：多状态/多类型的分支处理
-如果没有策略模式，糟糕的代码：大量if-else/switch，违反开闭原则
-策略模式的优势
-
-```java
-// ✅ 使用策略模式：每个策略只关心自己的逻辑
-public void handle(SecondScheduler scheduler) {
-    // 策略自己判断是否适用
-    for (SchedulerStrategy strategy : strategies) {
-        if (strategy.isEffective(scheduler)) {  // 策略自己知道何时该处理
-            strategy.handle(scheduler);          // 策略自己知道怎么处理
+    for (SecondScheduler secondScheduler : batchPipelines) {
+        // 策略链处理（状态机驱动）
+        chain.handle(secondScheduler);
+        
+        // 更新数据库状态
+        updateSecondScheduler(secondScheduler, subTaskInfo.getTaskId());
+        
+        // 失败或UNKNOWN状态，中断批次
+        if (shouldBreakAfterUpdate(secondScheduler)) {
             break;
         }
     }
 }
-// ✅ 每个策略职责单一，易于维护
-public class QueuingStrategy {
-    @Override
-    public boolean isEffective(SecondScheduler scheduler) {
-        return TaskStatus.isQueuing(scheduler.getStatus());  // 只关心QUEUING状态
-    }
-    
-    @Override
-    public void handle(SecondScheduler scheduler) {
-        // 处理QUEUING状态的逻辑，与其他策略隔离
-    }
-}
-public class SuccessStrategy {
-    @Override
-    public boolean isEffective(SecondScheduler scheduler) {
-        return TaskStatus.isSuccess(scheduler.getStatus());  // 只关心SUCCESS状态
-    }
-    
-    @Override
-    public void handle(SecondScheduler scheduler) {
-        atomicInteger.getAndIncrement();  // 只做计数
-    }
-}
-```
-策略模式解决的具体问题
-
-|问题|	解决方案|
-| ------------ | ------------ |
-|状态处理逻辑分散|	每个状态对应一个策略类，逻辑内聚|
-|新增状态需要修改多处|	新增策略类，工厂注册，无需修改调用方|
-|测试困难|	每个策略可独立单元测试|
-
----
-## 三、工厂模式解决的核心问题
-问题场景：对象创建与使用的耦合
-如果没有工厂模式：
-❌ 调用方需要知道所有策略的实现类
-
-工厂模式的优势
-
-```java
-// ✅ 使用工厂模式：调用方只依赖接口
-@Component
-public class TaskGenerationFactory {
-    private final Map<String, TaskCreateStrategy> strategyMap;
-    
-    public List<SecondScheduler> createTaskPipeline(TaskInfo taskInfo) {
-        String taskType = taskInfo.getTaskType();
-        TaskCreateStrategy strategy = Optional.ofNullable(strategyMap.get(taskType))
-            .orElseThrow(() -> new RuntimeException("no such taskType " + taskType));
-        return strategy.createTaskPipeline(taskInfo);
-    }
-}
-依赖注入的实现：
-// Spring自动将所有TaskCreateStrategy实现注入到Map中
-// key = @Component的名称，value = Bean实例
-@Component("training")      // key = "training"
-class TrainingTaskStrategy extends AbstractTaskCreateStrategy { ... }
-@Component("prediction")    // key = "prediction"
-class PredictionTaskStrategy extends AbstractTaskCreateStrategy { ... }
-@Component("evaluation")    // key = "evaluation"
-class EvaluationTaskStrategy extends AbstractTaskCreateStrategy { ... }
-```
-工厂模式解决的具体问题
-|问题	|解决方案|
-| ------------ | ------------ |
-|创建逻辑耦合	|工厂统一创建，调用方不关心创建细节|
-|依赖具体类	|调用方只依赖接口，具体类由工厂选择|
-|扩展困难	|新增策略只需加@Component，自动加入Map|
-|隐藏实现差异	|调用方无需知道有多少种策略实现|
----
-## 四、为什么不用状态模式 (State Pattern)?
-状态模式的特点
-
-```java
-// 状态模式：状态对象持有，内部状态转换
-class TaskContext {
-    private TaskState state;
-    
-    public void handle() {
-        state.handle(this);  // 状态对象处理并可能转换状态
-    }
-    
-    public void changeState(TaskState newState) {
-        this.state = newState;
-    }
-}
-interface TaskState {
-    void handle(TaskContext context);
-}
-class QueuingState implements TaskState {
-    @Override
-    public void handle(TaskContext context) {
-        // 处理QUEUING状态的逻辑
-        context.changeState(new RunningState());  // 状态转换
-    }
-}
-```
-为什么不适合这个场景
-|状态模式特点|	项目场景|	冲突点|
-| ------------ | ------------ |--|
-|状态转换在对象内部控制	|状态转换由外部（智算侧）决定|	无法预测下一个状态|
-|状态对象持有上下文|	需要访问DAO、配置、远程服务|	状态对象过于复杂|
-|状态转换触发行为|	行为由调度器决定|	状态只是数据，行为由策略决定|
-核心原因：
-
-```
-// 项目中：状态只是数据，行为由策略决定
-scheduler.getStatus();  // 只是读取状态值
-scheduler.setStatus("running");  // 由策略根据外部响应设置状态
-// 状态模式中：状态本身决定行为
-state.handle(context);  // 状态对象自己决定如何处理
-context.changeState(newState);  // 状态对象决定转换到哪个状态
 ```
 ---
-## 五、为什么不用责任链模式 (Chain of Responsibility)?
-责任链模式的特点
+### 步骤4：策略链状态机
 
 ```java
-// 责任链：请求沿着链传递，直到某个处理器处理
-abstract class Handler {
-    private Handler next;
-    
-    public void handle(Request request) {
-        if (canHandle(request)) {
-            doHandle(request);
-        } else if (next != null) {
-            next.handle(request);
-        }
-    }
-}
-class AuthHandler extends Handler {
-    @Override
-    protected boolean canHandle(Request request) {
-        return request.needAuth();
-    }
-}
-class ValidationHandler extends Handler {
-    @Override
-    protected boolean canHandle(Request request) {
-        return request.needValidation();
-    }
-}
-```
-为什么不适合这个场景，核心原因：
-
-```java
-// 责任链：每个处理器都有机会处理或传递
-public void handle(Request request) {
-    if (canHandle(request)) {
-        doHandle(request);  // 处理后可能继续传递
-    }
-    if (next != null) {
-        next.handle(request);  // 继续传递给下一个
-    }
-}
-// 策略模式：只匹配一个，执行后立即退出
-public void execute(SecondScheduler scheduler) {
+// SchedulerChain.handle() 第240行
+public void handle(SecondScheduler secondScheduler) {
     for (SchedulerStrategy strategy : strategies) {
-        if (strategy.isEffective(scheduler)) {
-            strategy.handle(scheduler);
-            break;  // 执行后立即退出，不继续匹配
+        if (!strategy.isEffective(secondScheduler)) {
+            continue;  // 当前策略不适用，跳过
+        }
+        strategy.handle(secondScheduler);  // 执行策略
+        if (strategy.isBreak(secondScheduler)) {
+            break;  // 执行完就中断，不再尝试后续策略
         }
     }
 }
 ```
-<span style="color:rgb(216,27,68)">**责任链核心语义是传递性，当前情况每个子任务只会被一个策略捕获执行，传递不了一点，所以不要用责任链模式**</span>！
-
+策略链顺序及作用:
+顺序	策略	触发条件	作用
+1	TimeoutStrategy	任意状态	检查是否超时，超时则标记失败
+2	QueuingStrategy	status == QUEUING	调用执行器的 execute() 方法开始执行
+3	RunningStrategy	status == RUNNING	调用执行器的 status() 方法查询状态
+4	PendingStrategy	status == PENDING	等待前置条件
+5	FailedStrategy	status == FAILURE	记录失败信息
+6	SuccessStrategy	status == SUCCESS	成功计数
 ---
-## 六、为什么结合策略模式和工厂模式？
-协作关系图
+### 步骤5：执行器分发
+QueuingStrategy 根据 invoke 类型分发到具体执行器：
 
-```
-┌─────────────────────────────────────────────────────────────────────────────┐
-│                    策略模式 + 工厂模式 协作                                  │
-├─────────────────────────────────────────────────────────────────────────────┤
-│                                                                             │
-│  调用方 (TaskStatusExecutor)                                                │
-│       │                                                                     │
-│       │  factory.createTaskPipeline(taskInfo)                               │
-│       ▼                                                                     │
-│  ┌─────────────────────────────────────────────────────────────────────┐   │
-│  │                         工 厂 方 式                                  │   │
-│  │  ┌─────────────────────────────────────────────────────────────┐    │   │
-│  │  │  Map<taskType, TaskCreateStrategy>                          │    │   │
-│  │  │  "training"      ───▶ TrainingTaskStrategy                  │    │   │
-│  │  │  "prediction"    ───▶ PredictionTaskStrategy                │    │   │
-│  │  │  ...                                                         │    │   │
-│  │  └─────────────────────────────────────────────────────────────┘    │   │
-│  └─────────────────────────────────────────────────────────────────────┘   │
-│       │                                                                     │
-│       │  strategy.createTaskPipeline() 返回 List<SecondScheduler>         │
-│       ▼                                                                     │
-│  调用方使用返回的子任务列表                                                  │
-│                                                                             │
-│  ─────────────────────────────────────────────────────────────────────────  │
-│                                                                             │
-│  调用方 (QueuingStrategy.handle)                                            │
-│       │                                                                     │
-│       │  builder.buildStart(record, isContinue)                            │
-│       ▼                                                                     │
-│  ┌─────────────────────────────────────────────────────────────────────┐   │
-│  │                         工 厂 方 式                                  │   │
-│  │  getBuilder(invoke) 根据invoke类型创建ParameterBuilder               │   │
-│  │       │                                                              │   │
-│  │       ▼                                                              │   │
-│  │  ┌─────────────────────────────────────────────────────────────┐    │   │
-│  │  │  switch(TaskTypeEnum.get(taskType))                         │    │   │
-│  │  │  TRAIN_UEM/TRAIN_BSLM  ───▶ TrainParameterBuilder           │    │   │
-│  │  │  INFER_RCA           ───▶ RcaInferParameterBuilder          │    │   │
-│  │  │  ...                                                         │    │   │
-│  │  └─────────────────────────────────────────────────────────────┘    │   │
-│  └─────────────────────────────────────────────────────────────────────┘   │
-│       │                                                                     │
-│       │  builder.buildStart() 构建请求参数                                 │
-│       ▼                                                                     │
-│  ParameterBuilder执行具体策略                                               │
-│                                                                             │
-└─────────────────────────────────────────────────────────────────────────────┘
+```java
+// QueuingStrategy.executeTask() 第101行
+private TaskStatus executeTask(final SecondScheduler secondScheduler) {
+    return executorFactory.get(secondScheduler.getInvoke()).execute(secondScheduler);
+}
 ```
 
-设计原则的体现
-
-```
-单一职责原则 (SRP)
-├─ TaskGenerationFactory: 只负责创建策略
-├─ TaskCreateStrategy: 只负责构建Pipeline
-└─ 各自职责清晰
-开闭原则 (OCP)
-├─ 新增策略: 只需新增策略类 + @Component
-└─ 修改调用方: 无需修改
-依赖倒置原则 (DIP)
-├─ 调用方依赖接口 (TaskCreateStrategy)
-└─ 具体实现由工厂注入
-里氏替换原则 (LSP)
-├─ 所有策略实现可互换
-└─ 调用方无感知具体类型
-```
+MExecutorFactory 的分发映射：
+invoke值	执行器	execute() 实际动作
+paramInit	TaskParamInitializingExecutor	初始化任务参数
+download	DownloadExecutor	从SFTP/HDFS下载数据
+intelligent	IntelligentInvokeExecutor	调用智算侧API启动训练/推理
+dataFunction	DataFunctionExecutor	执行数据处理（裁剪、转换等）
+upload	UploadExecutor	上传结果到存储
+cbbAppDB	CBBAppDBExecutor	CBB后处理结果入库
+T0	类似处理	T0后处理
 ---
 
-## 七、任务调度执行 - 本质解读
-一句话概括
-所谓的"处理任务"，就是通过 HTTP REST API 调用智算服务平台，驱动任务在智算集群上执行，并跟踪任务状态直到完成。
-
-### 核心调用链
+### 步骤6：IntelligentInvokeExecutor 执行智算任务
+这是最核心的执行器，以 invoke="intelligent" 为例：
 
 ```java
-SrconTaskScheduler                    TaskStatusExecutor              IntelligentInvoke
-(调度层 - 10秒轮询)                   (执行层 - N秒轮询)               (API调用层)
-     │                                    │                              │
-     ▼                                    ▼                              ▼
- 扫描QUEUING任务 ──────────────────> 扫描RUNNING任务 ───────────────> REST API调用
- 按优先级排序                          构建任务Pipeline                  │
- 分配集群资源                          策略模式执行子任务                ▼
- 更新状态为RUNNING                     状态同步 & 持久化           智算服务平台
-                                                                 (外部系统)
-
-```
-
-### 调度框架
-#### 3.1 第一层：任务调度 (SrconTaskScheduler)
-职责：资源分配 + 状态升级
-
-```java
-@Scheduled(fixedRate = 10000, initialDelay = 3000)  // 每10秒
-public void schedulePendingTasks() {
-    // 1. 获取分布式锁（Redis）
-    // 2. 查询所有 QUEUING 状态的任务
-    List<SrconTaskInfo> srconTaskInfos = srconTaskDao.queryTasksByStatus("queuing");
-    // 3. 按优先级排序
-    srconTaskInfos.sort((a, b) -> Integer.compare(b.getPriorityScore(), a.getPriorityScore()));
-    // 4. 分配集群资源
-    for (SrconTaskInfo taskInfo : srconTaskInfos) {
-        ClusterResourceResult result = clusterService.allocateClusterResource(taskInfo);
-        // 5. 更新状态为 RUNNING
-        srconTaskDao.updateTaskRunning(taskInfo.getTaskId(), result);
+// IntelligentInvokeExecutor.execute() 第90行
+@Override
+public TaskStatus execute(final SecondScheduler scheduler) {
+    String taskId = scheduler.getTaskId();
+    int batchNo = scheduler.getBatchNo();
+    
+    // 1. 检查是否需要跳过（如前置步骤未完成）
+    TaskStatus status = handleInferBeforeInvoke(taskInfo, taskId, batchNo);
+    if (status != null) {
+        return status;  // 需要等待
     }
+    
+    // 2. 构建调用参数
+    Optional<JSONObject> optional = buildParameter(scheduler, taskInfo, isBreakpointRetry);
+    
+    // 3. 调用智算侧API
+    boolean execute = invokeBusiness.execute(parameter, taskInfo.getTaskType(), taskId);
+    
+    // 4. 处理返回结果
+    return execute ? TaskStatus.RUNNING : TaskStatus.FAILURE;
 }
-
+调用智算侧API IntelligentInvokeBusiness.execute():
+// IntelligentInvokeBusiness.execute() 第65行
+public boolean execute(JSONObject input, String taskType, String subTaskId) {
+    // 调用 startTask API（如 model.platform.intelligent.start-task）
+    JSONObject execute = ApiFabricUtil.sendPostJsonRequest(startTask, input, taskType);
+    
+    int resultCode = execute.getIntValue("resultCode");
+    return resultCode == 0;
+}
 ```
-本质：把任务从"排队中"变为"分配了资源、准备执行"
-
-#### 3.2 第二层：任务状态执行 (TaskStatusExecutor)
-职责：Pipeline 构建 + 策略执行
+---
+### 步骤7：状态查询与推进
+当 execute() 返回 RUNNING 状态后，下一轮定时调度会：
 
 ```java
-@Scheduled(fixedDelayString = "${smart-scheduler.cron.task-status-scheduler}")  // 可配置周期
-public void scheduler() {
-    // 1. 获取分布式锁
-    // 2. 查询所有 RUNNING 状态的任务
-    List<TaskInfo> runningTasks = taskDao.queryRunningTasks();
-    // 3. 遍历处理
-    for (TaskInfo taskInfo : runningTasks) {
-        // 4. 构建或获取任务Pipeline
-        List<SecondScheduler> secondSchedulers = getSecondSchedulers(taskInfo);
-        // 5. 策略模式执行每个子任务
-        for (SecondScheduler scheduler : secondSchedulers) {
-            schedulerFactory.execute(scheduler);  // 根据状态匹配策略
-        }
+// RunningStrategy.handle() 第40行
+@Override
+public void handle(final SecondScheduler scheduler) {
+    // 调用执行器的status()方法查询智算侧状态
+    String status = executorFactory.get(scheduler.getInvoke()).status(scheduler);
+    
+    if (TaskStatus.isQueuing(status)) {
+        status = TaskStatus.RUNNING.getStatus();  // 仍在队列中，算作运行中
     }
+    
+    // 更新状态
+    scheduler.setStatus(status);
 }
-
 ```
-Pipeline 是什么：一个任务被拆分成多个子任务步骤 (SecondScheduler)
-
+IntelligentInvokeExecutor.status() 查询智算侧：
 
 ```java
-// 以 Prediction 预测任务为例，其 Pipeline 包含：
-Pipeline = [
-    SecondScheduler(step=1, invoke="infer_rca"),      // RCA推理
-    SecondScheduler(step=2, invoke="cbb"),            // CBB后处理
-    SecondScheduler(step=3, invoke="t0"),             // T0处理
-    SecondScheduler(step=4, invoke="srcon_agent"),    // Agent解释
-    SecondScheduler(step=5, invoke="agent_complaint_prepare")  // 投诉准备
-]
-
-```
-#### 3.3 第三层：智算服务调用 (IntelligentInvoke)
-
-职责：HTTP API 封装
-
-
-```java
-// 启动任务
-public String start(SecondScheduler scheduler, boolean isBreakpointRetry) {
-    // 1. 构建请求参数
-    ParameterBuilder builder = getBuilder(scheduler.getInvoke());
-    ImmutablePair<String, JSONObject> pair = builder.buildStart(intelligentRecord, isBreakpointRetry);
+// IntelligentInvokeExecutor.status() 第152行
+@Override
+public String status(final SecondScheduler scheduler) {
+    // 调用 searchTask API 查询智算侧状态
+    ImmutablePair<String, List<ModelTaskInfo>> pair = 
+        invokeBusiness.queryModelTaskInfo(task, taskType, step);
     
-    // 2. 构造HTTP请求
-    RestRecord execRecord = new RestRecord(pair.left, pair.right, scheduler.getProxy());
-    
-    // 3. 发送POST请求
-    JSONObject response = RestUtil.sendPostJsonRequest(execRecord);
-    
-    // 4. 解析响应，保存结果
-    ModelTaskResult modelTaskResult = buildModelTaskResult(scheduler, response);
-    taskDao.saveModelTaskResult(modelTaskResult);
-    
-    return TaskStatus.RUNNING.getStatus();  // 返回任务在智算侧的状态
+    return pair.left;  // 返回智算侧状态：SUCCESS/FAILURE/RUNNING
 }
-
-// 查询状态
-public String status(SecondScheduler scheduler) {
-    ParameterBuilder builder = getBuilder(scheduler.getInvoke());
-    ImmutablePair<String, JSONObject> pair = builder.buildSearch(intelligentRecord);
-    RestRecord execRecord = new RestRecord(pair.left, pair.right, scheduler.getProxy());
-    JSONObject response = RestUtil.sendPostJsonRequest(execRecord);
-    return covertStatus(response);  // 转换智算侧状态 -> 内部状态
-}
+```
+---
+完整状态流转图
 
 ```
-
-### 具体在干什么 - 以预测任务为例
-
-
+定时调度触发（每分钟）
+    │
+    ▼
+TaskStatusExecutor.schedule()
+    │
+    ▼
+查询未完成的 SubTaskInfo 列表
+    │
+    ▼
+对每个 SubTaskInfo 执行:
+    │
+    ├─→ 按 batchNo 分组
+    │
+    ├─→ batchNo=1 的 SecondScheduler 列表
+    │   │
+    │   ├─→ step=1 (QUEUING) → QueuingStrategy.handle()
+    │   │   └─→ executorFactory.get("paramInit").execute()
+    │   │       └─→ 状态变为 RUNNING
+    │   │
+    │   ├─→ step=2 (QUEUING) → QueuingStrategy.handle()
+    │   │   └─→ executorFactory.get("download").execute()
+    │   │       └─→ 状态变为 RUNNING
+    │   │
+    │   ├─→ step=3 (QUEUING) → QueuingStrategy.handle()
+    │   │   └─→ executorFactory.get("intelligent").execute()
+    │   │       └─→ 调用智算侧API，状态变为 RUNNING
+    │   │
+    │   ├─→ step=4 (RUNNING) → RunningStrategy.handle()
+    │   │   └─→ executorFactory.get("intelligent").status()
+    │   │       └─→ 智算侧仍在运行，保持 RUNNING
+    │   │
+    │   ├─→ step=4 (RUNNING) → RunningStrategy.handle()
+    │   │   └─→ executorFactory.get("intelligent").status()
+    │   │       └─→ 智算侧完成，状态变为 SUCCESS
+    │   │
+    │   ├─→ step=5 (QUEUING) → QueuingStrategy.handle()
+    │   │   └─→ executorFactory.get("upload").execute()
+    │   │       └─→ 上传结果，状态变为 RUNNING → SUCCESS
+    │   │
+    │   └─→ batchNo=1 全部 SUCCESS
+    │
+    ├─→ batchNo=2 的 SecondScheduler 列表（开始执行）
+    │   └─→ 同上流程...
+    │
+    └─→ 所有 batch 完成 → SubTaskInfo 状态变为 SUCCESS
 ```
-用户发起"预测任务"
-         │
-         ▼
-┌─────────────────────────────────────────────────────────────┐
-│ 第一阶段：任务创建 (createTask)                               │
-│ - 生成子任务ID                                               │
-│ - 计算优先级                                                 │
-│ - 分配存储资源                                               │
-│ - 插入数据库，状态=INIT                                      │
-└─────────────────────────────────────────────────────────────┘
-         │
-         ▼
-┌─────────────────────────────────────────────────────────────┐
-│ 第二阶段：任务启动 (startTask)                                │
-│ - 更新状态 INIT -> QUEUING                                  │
-└─────────────────────────────────────────────────────────────┘
-         │
-         ▼
-┌─────────────────────────────────────────────────────────────┐
-│ 第三阶段：任务调度 (SrconTaskScheduler 每10秒)                │
-│ - 扫描 QUEUING 任务                                          │
-│ - 分配集群资源 (GPU服务器)                                   │
-│ - 更新状态 QUEUING -> RUNNING                                │
-└─────────────────────────────────────────────────────────────┘
-         │
-         ▼
-┌─────────────────────────────────────────────────────────────┐
-│ 第四阶段：Pipeline执行 (TaskStatusExecutor)                  │
-│                                                             │
-│ Step 1: infer_rca (RCA推理)                                 │
-│   ├─ QueuingStrategy.handle()                               │
-│   ├─ 构建请求参数 {input_path, model, rat, ...}             │
-│   ├─ HTTP POST 到智算平台                                    │
-│   ├─ 返回 task_id, status=running                           │
-│   └─ 状态: queuing -> running                               │
-│                                                             │
-│ Step 2: cbb (后处理) - 等待Step1完成                         │
-│   ...                                                       │
-│                                                             │
-│ Step 3-5: 类似处理...                                       │
-└─────────────────────────────────────────────────────────────┘
-         │
-         ▼
-┌─────────────────────────────────────────────────────────────┐
-│ 第五阶段：状态同步 (RunningStrategy 每N秒)                    │
-│ - 轮询智算平台: HTTP POST status API                        │
-│ - 获取当前阶段 current_stage                                 │
-│ - 获取结果路径 result_path                                   │
-│ - 更新本地 ModelTaskResult                                  │
-└─────────────────────────────────────────────────────────────┘
-         │
-         ▼
-┌─────────────────────────────────────────────────────────────┐
-│ 第六阶段：任务完成                                           │
-│ - 所有子任务 Success -> 任务整体 SUCCESS                     │
-│ - 模型更新: modelTransferService.modelUpdate()              │
-│ - 结果数据在 sftpMountPrefix 目录                           │
-└─────────────────────────────────────────────────────────────┘
-
-```
-### 总结
-|问题|	答案|
-|--|--|
-|处理任务处理了什么？|	通过 REST API 驱动智算平台执行任务|
-|核心操作是什么？	|start() 启动任务、status() 查询状态|
-|任务怎么拆解？	|按 invoke 类型拆成 Pipeline，多步骤串行执行|
-|如何跟踪进度？	|定时轮询智算平台 API，状态同步到本地数据库|
-|任务间关系？	|Pipeline 中前一步输出作为后一步输入，通过 result_path 传递|
-|外部依赖？	|智算服务平台 (AI PDU/Manas)，通过 HTTP 调用|
-
-
-
+---
+关键点总结
+问题	答案
+定时调度多久触发	每分钟 (@Scheduled(cron = "0 */1 * * * *"))
+每次调度处理什么	所有状态为 QUEUING/RUNNING 的 SecondScheduler
+如何决定执行顺序	按 batchNo → step 顺序执行
+如何触发实际执行	QueuingStrategy 调用执行器的 execute() 方法
+如何知道执行结果	RunningStrategy 调用执行器的 status() 方法查询
+失败怎么办	记录错误码，停止后续步骤和批次执行
