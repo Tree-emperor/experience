@@ -840,3 +840,141 @@ digraph design_reviewer {
 ## 一句话准则
 
 **你是把关人，不是凑章节的检查器：对齐模板与裁剪、以 clarify.md 为覆盖基线、以设计决策记录为保真基线，把"假设是否被用户裁决""第11章是否真实留痕（无编造）""复用资产是否真实存在"作为头等检查；剔除一切模板之外的过程产物与实现细节；只报有把握的实质问题，并把问题分清"文档保真类（可直接修复）"与"用户意图类（回到用户确认）"，存在 Critical/Important 即 FAIL。**
+
+---
+name: "mindspec:apply"
+description: 实现sdd开发范式变更中的任务
+category: Workflow
+tags: [ workflow, artifacts, experimental ]
+---
+
+实现sdd开发范式变更中的任务。你需要按步骤执行，每一步均需要输出内容，切每一步的执行都先这个步骤的内容[Step-X ....]
+
+# 输入
+可选地指定变更名称（例如，`/mindspec:apply add-auth`）。如果省略，检查是否可以从对话上下文中推断。如果模糊或不明确，您必须提示可用的变更。
+
+# 步骤
+
+## Step-1 选择变更
+
+如果提供了名称，使用它。否则：
+
+- 如果用户提到了变更，从对话上下文中推断
+- 如果只有一个活跃的变更，自动选择
+- 如果不明确，运行 `openspec list --json` 获取可用变更，并使用 **AskUserQuestion tool** 让用户选择
+
+始终宣布："Using change: " 以及如何覆盖（例如，`/mindspec:apply <other>`）。
+
+## Step-2 检查schema和artifacts
+
+  ```bash
+  openspec status --change "<name>" --json
+  ```
+
+解析JSON以了解：
+
+- `schemaName`: 正在使用的流程（例如，"spec-driven"）
+- 哪个artifact包含任务（spec-driven通常为"tasks"，其他请检查状态）
+
+## Step-3 检查状态
+
+  ```bash
+  openspec instructions apply --change "<name>" --json
+  ```
+
+命令返回内容：
+- `contextFiles`:artifactID -> 具体文件路径数组（因schema而异）
+- 进度（总数、已完成、剩余）
+- 带状态的任务列表
+- 基于当前状态的动态 instruction
+
+**检查状态：**
+- 如果 `state: "blocked"`（缺少artifact）：显示消息，建议使用 `/mindspec:continue`
+- 如果 `state: "all_done"`：恭喜，建议归档
+- 否则：继续实现
+
+## Step-4 判断任务是否明确
+
+派发如下Agent(禁止在主Agent中直接执行)
+```
+Agent tool (Explore):
+description: "通过`contextFiles`判断任务是否已清晰、明确"
+prompt: |
+    ### 任务目标
+    通过`contextFiles`判断任务是否已清晰、明确
+    
+    ### 输入文件
+    apply指令输出的 `contextFiles` 下列出的每个文件路径。
+    
+    ### 输出内容
+    ```markdown
+    Change: [change name]
+    Spec: [Summary of Spec]
+    Design: [Summary of Design]
+    Conclusion: [Assess whether the task is clear and well-defined]
+    ```
+```
+
+## Step-5 变更实施
+
+### Step-5.1 显示进度
+```markdown
+Change: [change name]
+Schema: [正在使用的Schema]
+Progress: [N/M tasks completed]
+Remaining Tasks:
+    - [剩余Task列表，带简要描述]
+Instruction: [apply指令输出中的 `instruction`]
+```
+### Step-5.2 执行Instruction命令
+IMPORTANT: **严格按照`instruction`中的内容执行**，**如果`instruction`要求使用技能，在任何场景下都需要使用技能，技能中会自动理解上下文**。
+
+### Step-5.3 完成变更
+使用技能 **mindspec:spec-sps-finishing-a-development-branch**，完成这次变更。
+
+## Step-6 完成或暂停时，显示状态
+
+**输出**
+
+- 本次会话完成的任务
+- 总体进度："N/M tasks completed"
+- 如果全部完成：建议归档
+- 如果暂停：解释原因并等待指导
+
+**完成时的输出**
+
+```
+## Implementation Completed
+
+**Change:** <change-name>
+**Schema:** <schema-name>
+**Progress:** 7/7 tasks complete ✓
+
+### Completed This Session
+- [x] Task 1
+- [x] Task 2
+...
+
+All tasks complete! You can archive this change with `/mindspec:archive`.
+```
+
+# 防护栏
+
+- 持续处理任务直到完成或被阻塞
+- 开始前始终先理解上下文
+- 如果任务不明确，暂停并在实现前询问
+- 严格执行`instruction`
+- 如果实现揭示问题，暂停并建议artifact更新
+- 保持代码更改最小化并限定在每个任务范围内
+- 完成每个任务后立即更新任务复选框
+- 遇到错误、阻塞或不明确的要求时暂停 - 不要猜测
+- 使用CLI输出中的contextFiles，不要假设特定的文件名
+
+# 流式工作流集成
+
+此技能支持"对变更执行操作"模型：
+
+- **可随时调用**：在所有artifact完成之前（如果存在任务）、部分实现之后、与其他操作交错进行
+- **允许artifact更新**：如果实现揭示设计问题，建议更新artifact - 不是阶段锁定的，流畅工作
+
+
