@@ -931,3 +931,56 @@ openspec/changes/<change-name>/plans/plan-4-6.md (包含任务组 4, 5, 6，共 
 }
 
 ```
+
+---
+name: spec-exec
+description: "当 OpenSpec 变更已准备好 plan 工件，执行并实现计划时使用。"
+---
+
+1. **执行计划**
+   
+   针对每个 plan 文件，按顺序依次使用（使用技能即可，无需读取文件内容）**SKILL**`mindspec:spec-sps-subagent-driven-development` 来完成任务：
+
+   **如果技能执行失败**: 停止并显示：
+   > 请正确安装 mindspec，或使用 `/mindspec:apply` 重试。
+
+2. **同步 tasks.md**
+
+   执行完成后（或部分完成），读取所有的 plan 计划文件，对每个 plan 文件执行如下动作：
+
+   a. **记录任务编号与状态**。
+
+   在当前读取的 plan 文件中，扫描每个 Task 定义部分。如果在标题末尾发现了状态标记，如 `### Task 1.1: Do the thing [DONE]` ，请记录：
+   - Task 编号，例如 1.1（必须是精确匹配，因此 `1.1` 不会匹配 `1.10`）
+   - 任务状态：`DONE` / `DONE_WITH_CONCERNS` / `NEEDS_CONTEXT` / `BLOCKED`
+
+   b. **更新 tasks.md**:
+   对于记录中每个状态为 `DONE`（表示已完成）的 Task，通过 Task 编号在 `tasks.md` 中精确匹配查找对应行（例如，`- [ ] 1.1 ` — 其中 1.1 为匹配的Task 编号，后跟一个空格。绝不是前缀匹配，因此 `1.1` 不会匹配 `1.10`），并将 `- [ ]` 更改为 `- [x]`。
+   对于其他状态（非 DONE）的 Task，保持其在 tasks.md 中的未完成状态不做处理。
+
+3. **报告同步结果**:
+      ```
+      ## Task 同步结果
+
+      已同步到 tasks.md：
+      - [x] 1.1 Create index.html (来自 plan-1-3.md)
+      - [x] 1.2 Write CSS (来自 plan-1-3.md)
+
+      仍在进行中：
+      - [ ] 2.1 Implement data model (3/5 个计划任务已完成)
+
+      总体进度：2/3 个 Task 已完成
+      ```
+
+4. **显示最终状态**
+   判断 tasks.md 中是否所有任务已完成。
+
+   显示：
+   - 如果全部完成：建议使用 `/mindspec:verify` 然后使用 `/mindspec:archive`
+   - 如果部分完成：建议使用 `/mindspec:apply` 继续
+
+   **防护措施**
+   - 变更名称必须匹配 `[A-Za-z0-9_-]+` — 在替换到 shell 命令之前，拒绝任何包含空格、引号或特殊字符的名称
+   - 即使执行是部分的，执行后也始终同步 tasks.md
+   - 除非 plan 文件中任务被明确标记为完成 [DONE]，否则绝不将 tasks.md 中的任务标记为完成
+   - 不要修改任何现有的 OpenSpec 命令或配置模板文件
