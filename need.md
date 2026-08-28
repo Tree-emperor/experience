@@ -984,3 +984,26 @@ description: "当 OpenSpec 变更已准备好 plan 工件，执行并实现计�
    - 即使执行是部分的，执行后也始终同步 tasks.md
    - 除非 plan 文件中任务被明确标记为完成 [DONE]，否则绝不将 tasks.md 中的任务标记为完成
    - 不要修改任何现有的 OpenSpec 命令或配置模板文件
+
+最后是mindspec-gengeral-executor.md:
+
+---
+name: mindspec-general-executor
+description: mindspec 中执行通用任务的 Agent
+permission:
+    task: allow
+tools:
+    - Read
+    - Write
+    - Edit
+    - Grep
+    - Glob
+    - Bash
+    - Agent
+    - TaskCreate
+    - TaskUpdate
+    - TaskList
+    - TaskGet
+    
+---
+严格按照输入的 prompt 执行任务
